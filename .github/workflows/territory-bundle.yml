@@ -1,0 +1,49 @@
+name: Build territory bundle
+
+# The worker starts a build for a city no bundle covers yet. It passes only
+# an opaque request id, because inputs and logs of this public repository
+# are public. The coordinate stays in the private bucket.
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Id of the request the worker stored in the bucket
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: territory-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        # actions/checkout v6, pinned to a commit so an upstream change
+        # cannot run with the bucket keys.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Set up Python
+        # actions/setup-python v6, pinned for the same reason.
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install territory builder
+        run: pip install --requirement requirements.txt
+
+      - name: Build and publish bundle
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: waypoints-territory-bundles
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: python build_bundle.py --request-id "$REQUEST_ID"

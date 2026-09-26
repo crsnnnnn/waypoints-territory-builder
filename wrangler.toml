@@ -1,0 +1,15 @@
+name = "waypoints-territory-bundles"
+main = "worker.js"
+compatibility_date = "2026-09-18"
+workers_dev = true
+preview_urls = false
+
+[vars]
+GITHUB_REPOSITORY = "crsnnnnn/waypoints-territory-builder"
+GITHUB_WORKFLOW = "territory-bundle.yml"
+GITHUB_REF = "main"
+MAX_DAILY_BUILDS = "500"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "waypoints-territory-bundles"
