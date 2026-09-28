@@ -12,10 +12,12 @@ there gets old areas while it rebuilds. Run this after every revision bump:
 private bucket under a random id and the public workflow gets only that id, so
 no coordinate or place name reaches the public run logs.
 
-A rebuild on a newer Overture release can publish a city under a new id, which
-leaves the old id's manifest, bundles and index entries behind. `clean`
-deletes a city whose manifest is below the current revision only when the
-Worker already answers its point with a current bundle.
+A rebuild on a newer Overture release can publish a city under a new id. The
+builder deletes the old copy itself when both come from one OpenStreetMap
+relation, and `clean` catches the rest: it deletes a city whose manifest is
+below the current revision when the Worker already answers its point with a
+current bundle, and of cities stored more than once under one relation it
+keeps only the newest.
 
 Needs only the standard library, a `npx wrangler login` session for the
 bucket and an authenticated `gh` for the workflow. `--dry-run` lists what
@@ -83,6 +85,7 @@ def main() -> None:
         f"accounts/{cloudflare.account}/workers/subdomain"
     )["subdomain"]
     endpoint = f"https://{worker}.{subdomain}.workers.dev/v1/bundle"
+    removed = set()
     for manifest in outdated:
         served = served_version(endpoint, manifest)
         if served is None or bundle_revision(served) < revision:
@@ -91,6 +94,20 @@ def main() -> None:
             print(f"kept {manifest['cityId']}: its point is served {served}")
             continue
         clean(cloudflare, objects, manifest, args.dry_run)
+        removed.add(manifest["cityId"])
+
+    by_relation: dict[int, list[dict[str, Any]]] = {}
+    for manifest in manifests:
+        if manifest["cityId"] in removed:
+            continue
+        relation = relation_id(cloudflare, objects, manifest)
+        if relation is not None:
+            by_relation.setdefault(relation, []).append(manifest)
+    for copies in by_relation.values():
+        copies.sort(key=lambda m: int(m.get("updatedAt") or 0), reverse=True)
+        for manifest in copies[1:]:
+            print(f"{manifest['cityId']} is an older copy of {copies[0]['cityId']}")
+            clean(cloudflare, objects, manifest, args.dry_run)
 
 
 def rebuild(
@@ -155,6 +172,19 @@ def clean(
         else:
             cloudflare.delete(f"{objects}/{key}")
     print(f"{'would remove' if dry_run else 'removed'} {city}: {len(keys)} objects")
+
+
+def relation_id(
+    cloudflare: Cloudflare, objects: str, manifest: dict[str, Any]
+) -> int | None:
+    """OpenStreetMap relation of a city, from its manifest or its bundle."""
+    if manifest.get("relationId") is not None:
+        return int(manifest["relationId"])
+    body = cloudflare.call("GET", f"{objects}/{manifest['bundleKey']}")
+    if body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+    relation = ((json.loads(body).get("city") or {}).get("area") or {}).get("relationId")
+    return None if relation is None else int(relation)
 
 
 def served_version(endpoint: str, manifest: dict[str, Any]) -> str | None:

@@ -27,7 +27,13 @@ served while a fresh one builds in the background. A bundle of an older revision
 carries a `Retry-After` header while it rebuilds, so the app asks once more
 and picks up the new one without a relaunch. Once the fresh bundle is
 published, the city's older bundles and the lookup tiles it no longer
-covers are deleted, so the bucket holds one bundle per city.
+covers are deleted, so the bucket holds one bundle per city. A newer Overture
+release can give a place a new id, so the build also deletes any copy of the
+place stored earlier under another id, recognised by the OpenStreetMap
+relation both come from. Where outlines overlap, such as a county built for a
+request in the countryside and the towns inside it, the Worker serves the
+smallest outline holding the point, and between two copies of one place the
+newer.
 
 ## Rebuilding every city after a revision
 
@@ -41,10 +47,11 @@ python3 rebuild_bundles.py rebuild
 python3 rebuild_bundles.py clean
 ```
 
-Run `clean` once the builds have finished. A rebuild on a newer Overture
-release can publish a city under a new id, and `clean` deletes the old id's
-manifest, bundles and index entries, but only when the Worker already answers
-that city's point with a current bundle. Both commands take `--dry-run`. The
+Run `clean` once the builds have finished. It deletes a city still below the
+current revision only when the Worker already answers that city's point with a
+current bundle, and of cities stored more than once under one OpenStreetMap
+relation it keeps only the newest. Builds remove such copies themselves, so
+this catches what an interrupted or older build left. Both commands take `--dry-run`. The
 script needs a `npx wrangler login` session and an authenticated `gh`, and it
 starts builds the way the Worker does, so coordinates stay out of the public
 logs.

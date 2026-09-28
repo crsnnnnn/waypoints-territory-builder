@@ -21,6 +21,9 @@ const CURRENT_BUNDLE_REVISION = 14;
 // past a city's land boundary finds the bundle built for it.
 const CITY_MATCH_TOLERANCE_METERS = 250;
 const METERS_PER_DEGREE = 111_320;
+// Outlines within this share of each other's size are one place stored under
+// two ids, and the newer of them is served.
+const SAME_PLACE_AREA_RATIO = 1.02;
 
 export default {
   async fetch(request, env, context) {
@@ -103,7 +106,7 @@ function bundleRevision(version) {
 async function findCandidate(bucket, tile, latitude, longitude) {
   const prefix = `index/${INDEX_ZOOM}/${tile.x}/${tile.y}/`;
   let cursor;
-  let newest = null;
+  const holding = [];
   let nearest = null;
   let nearestDistance = CITY_MATCH_TOLERANCE_METERS;
   do {
@@ -131,15 +134,56 @@ async function findCandidate(bucket, tile, latitude, longitude) {
         }
         continue;
       }
-      const updatedAt = Number(candidate.updatedAt || 0);
-      const newestUpdatedAt = Number(newest?.updatedAt || 0);
-      if (!newest || updatedAt > newestUpdatedAt) {
-        newest = candidate;
-      }
+      holding.push({ candidate, area: outlineArea(candidate.boundary) });
     }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
-  return newest || nearest;
+  return mostSpecific(holding) || nearest;
+}
+
+// A county or region is built when a request falls outside every town, and
+// its outline then holds the towns inside it. Serving the newest outline
+// gave Zadar the whole of Zadar County whenever the county was built after
+// the town, so the smallest outline holding the point is served. Only
+// between outlines of practically one size, which are one place stored under
+// an old and a new id, does the newer one win.
+function mostSpecific(holding) {
+  if (holding.length === 0) return null;
+  const smallest = Math.min(...holding.map((entry) => entry.area));
+  let chosen = null;
+  for (const entry of holding) {
+    if (entry.area > smallest * SAME_PLACE_AREA_RATIO) continue;
+    if (
+      !chosen ||
+      Number(entry.candidate.updatedAt || 0) >
+        Number(chosen.updatedAt || 0)
+    ) {
+      chosen = entry.candidate;
+    }
+  }
+  return chosen;
+}
+
+// Area of an outline in square degrees, scaled for latitude. It only ranks
+// outlines around one point against each other, so no projection is needed.
+function outlineArea(boundary) {
+  const ringArea = (ring) => {
+    if (!Array.isArray(ring) || ring.length < 4) return 0;
+    let twice = 0;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [latitudeI, longitudeI] = ring[i];
+      const [latitudeJ, longitudeJ] = ring[j];
+      const scale = Math.cos((((latitudeI + latitudeJ) / 2) * Math.PI) / 180);
+      twice += (longitudeJ - longitudeI) * scale * (latitudeJ + latitudeI);
+    }
+    return Math.abs(twice) / 2;
+  };
+  const sum = (rings) =>
+    (Array.isArray(rings) ? rings : []).reduce(
+      (total, ring) => total + ringArea(ring),
+      0,
+    );
+  return sum(boundary?.outer) - sum(boundary?.inner);
 }
 
 async function enqueueBuild(env, tile, latitude, longitude) {

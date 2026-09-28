@@ -2313,6 +2313,7 @@ def publish_bundle(
         "longitude": representative[1],
         "updatedAt": int(time.time() * 1000),
         "tiles": [[x, y] for x, y in tiles],
+        "relationId": bundle["city"]["area"]["relationId"],
     }
     client.put_object(
         Bucket=bucket_name,
@@ -2333,6 +2334,23 @@ def publish_bundle(
         tiles=set(tiles),
         previous_tiles=previous_tiles,
     )
+    try:
+        retired = retire_replaced_cities(
+            client,
+            bucket_name,
+            city_key=city_key,
+            relation_id=bundle["city"]["area"]["relationId"],
+            updated_at=int(bundle["updatedAt"]),
+            tiles=set(tiles),
+        )
+    except Exception as error:
+        # The bundle is already published, and a city left here is never
+        # served where this one covers it. The next build over it, or
+        # rebuild_bundles.py clean, removes it.
+        print(f"Replaced city cleanup failed: {type(error).__name__}")
+    else:
+        if retired:
+            print(f"Removed {retired} replaced cities")
 
 
 def published_index_tiles(
@@ -2395,6 +2413,86 @@ def remove_superseded(
     # builder already makes against R2.
     for key in keys:
         client.delete_object(Bucket=bucket_name, Key=key)
+
+
+def retire_replaced_cities(
+    client: Any,
+    bucket_name: str,
+    *,
+    city_key: str,
+    relation_id: int,
+    updated_at: int,
+    tiles: set[tuple[int, int]],
+) -> int:
+    """Deletes this place's copies stored under an older Overture id.
+
+    A newer Overture release can give a place a new id, and its build then
+    publishes the place beside the old copy instead of over it, leaving the
+    old bundles, index entries and manifest in the bucket for good. The
+    OpenStreetMap relation a place comes from stays the same across releases,
+    so a city indexed in this city's lookup tiles is deleted when it has the
+    same relation and was published earlier.
+
+    Overlap alone cannot tell a copy from a different place: a county built
+    for a request in the countryside holds the towns inside it, such as Zadar
+    County and Zadar. A place with no relation gets an id derived from its
+    Overture id, which never matches a copy under another id, so it is kept.
+    """
+    found: dict[str, set[tuple[int, int]]] = {}
+    for x, y in sorted(tiles):
+        for key, _ in list_objects(client, bucket_name, f"index/{INDEX_ZOOM}/{x}/{y}/"):
+            other = key.rsplit("/", 1)[1].removesuffix(".json")
+            if other != city_key:
+                found.setdefault(other, set()).add((x, y))
+
+    retired = 0
+    for other, other_tiles in sorted(found.items()):
+        x, y = min(other_tiles)
+        candidate = read_json_object(
+            client, bucket_name, f"index/{INDEX_ZOOM}/{x}/{y}/{other}.json"
+        )
+        if candidate is None or int(candidate.get("updatedAt") or 0) >= updated_at:
+            continue
+        if stored_relation_id(client, bucket_name, other, candidate) != relation_id:
+            continue
+        keys = [key for key, _ in list_objects(client, bucket_name, f"bundles/{other}/")]
+        keys.extend(
+            f"index/{INDEX_ZOOM}/{tx}/{ty}/{other}.json"
+            for tx, ty in sorted(
+                published_index_tiles(client, bucket_name, other) | other_tiles
+            )
+        )
+        # The manifest goes last, so rebuild_bundles.py clean still finds a
+        # city whose deletion was interrupted.
+        keys.append(f"manifests/{other}.json")
+        for key in keys:
+            client.delete_object(Bucket=bucket_name, Key=key)
+        retired += 1
+    return retired
+
+
+def stored_relation_id(
+    client: Any, bucket_name: str, city_key: str, candidate: dict[str, Any]
+) -> int | None:
+    """Relation of a stored city, from its manifest or else from its bundle.
+
+    Manifests carry the relation since it was added to them. For one written
+    before, the city's bundle is read once instead.
+    """
+    manifest = read_json_object(client, bucket_name, f"manifests/{city_key}.json")
+    if manifest is not None and manifest.get("relationId") is not None:
+        return int(manifest["relationId"])
+    bundle_key = candidate.get("bundleKey")
+    if not isinstance(bundle_key, str):
+        return None
+    try:
+        body = client.get_object(Bucket=bucket_name, Key=bundle_key)["Body"].read()
+    except client.exceptions.NoSuchKey:
+        return None
+    if body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+    relation = ((json.loads(body).get("city") or {}).get("area") or {}).get("relationId")
+    return None if relation is None else int(relation)
 
 
 def read_json_object(client: Any, bucket_name: str, key: str) -> dict[str, Any] | None:
