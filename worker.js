@@ -170,17 +170,23 @@ async function enqueueBuild(env, tile, latitude, longitude) {
     return { ok: false, status: 503, error: "builder_not_configured" };
   }
 
-  const marker = JSON.stringify({
+  const requestedAt = new Date().toISOString();
+  const request = JSON.stringify({
     requestKey,
     latitude,
     longitude,
-    requestedAt: new Date().toISOString(),
+    requestedAt,
   });
+  // Only the build request carries the coordinate, and the builder deletes
+  // it when the build ends. The cooldown and daily-count records need only
+  // the time, so they hold nothing about where anyone was, and the bucket's
+  // lifecycle rules delete all request records after a day.
+  const marker = JSON.stringify({ requestedAt });
   const metadata = { httpMetadata: { contentType: "application/json" } };
   // The builder's run logs are public, so the coordinate stays in the
   // bucket and the build is told only an opaque id to read it by.
   const requestId = crypto.randomUUID();
-  await env.BUCKET.put(`requests/by-id/${requestId}.json`, marker, metadata);
+  await env.BUCKET.put(`requests/by-id/${requestId}.json`, request, metadata);
   const dispatched = await dispatchBuild(env, requestId);
   if (!dispatched) {
     await env.BUCKET.delete(`requests/by-id/${requestId}.json`);
@@ -189,7 +195,7 @@ async function enqueueBuild(env, tile, latitude, longitude) {
 
   await Promise.all([
     env.BUCKET.put(markerKey, marker, metadata),
-    env.BUCKET.put(`${dailyPrefix}${tile.x}-${tile.y}.json`, marker, metadata),
+    env.BUCKET.put(`${dailyPrefix}${requestId}.json`, marker, metadata),
   ]);
   return { ok: true, requestKey };
 }

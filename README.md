@@ -59,6 +59,19 @@ box, or place name, and report a failure only by its error type. The stored
 request is deleted when the build ends, whether it published a bundle or
 failed.
 
+The coordinate lives only in that stored request. The records the Worker
+keeps to wait out a request's six-hour cooldown and to count the day's
+builds hold only the time. The cooldown record is still named after its
+zoom-12 lookup tile, an area about 10 km across, because the Worker finds it
+by that name. A published build deletes it, and the bucket's lifecycle rules
+delete everything under `requests/` and `requests-by-day/` after a day, so a
+failed build's records are gone the next day too:
+
+```
+npx wrangler r2 bucket lifecycle add waypoints-territory-bundles expire-build-requests requests/ --expire-days 1
+npx wrangler r2 bucket lifecycle add waypoints-territory-bundles expire-daily-build-counts requests-by-day/ --expire-days 1
+```
+
 ## One-time setup
 
 The Worker binds the `waypoints-territory-bundles` R2 bucket as `BUCKET` and
