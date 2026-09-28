@@ -23,7 +23,9 @@ that overlap or lie within 100 m are one place mapped twice and are merged. A
 bundle carries at most 500 areas, which leaves large cities room to fill the
 gaps their outlines leave, and a fifth of the room left after the outlines is kept
 for named land and road areas. Bundles older than 35 days, or built under an older revision, keep being
-served while a fresh one builds in the background. Once the fresh bundle is
+served while a fresh one builds in the background. A bundle of an older revision
+carries a `Retry-After` header while it rebuilds, so the app asks once more
+and picks up the new one without a relaunch. Once the fresh bundle is
 published, the city's older bundles and the lookup tiles it no longer
 covers are deleted, so the bucket holds one bundle per city.
 

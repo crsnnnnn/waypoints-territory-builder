@@ -6,6 +6,10 @@ const DEFAULT_DAILY_BUILD_LIMIT = 25;
 // sheet open, so it asks again soon enough to show the bundle within seconds
 // of it landing. Each ask is one small index read.
 const DEFAULT_RETRY_AFTER_SECONDS = 5;
+// A bundle of an older builder revision is served with this Retry-After while
+// its rebuild runs, so an app that already holds it asks once more after the
+// rebuild lands instead of keeping the old areas until it is relaunched.
+const REBUILD_RETRY_AFTER_SECONDS = 30;
 const REQUIRED_BUNDLE_REVISION = 6;
 // Revision the builder writes now. An older bundle that still meets the
 // required revision is served as it is and rebuilt in the background, the way
@@ -44,22 +48,30 @@ export default {
       candidate &&
       bundleRevision(candidate.version) >= REQUIRED_BUNDLE_REVISION
     ) {
+      const outdated =
+        bundleRevision(candidate.version) < CURRENT_BUNDLE_REVISION;
       if (
         Date.now() - Number(candidate.updatedAt || 0) > BUNDLE_REFRESH_MS ||
-        bundleRevision(candidate.version) < CURRENT_BUNDLE_REVISION
+        outdated
       ) {
         context.waitUntil(enqueueBuild(env, tile, latitude, longitude));
       }
+      const rebuildHeaders = outdated
+        ? { "Retry-After": String(REBUILD_RETRY_AFTER_SECONDS) }
+        : {};
       const currentVersion = url.searchParams.get("version");
       if (currentVersion && currentVersion === candidate.version) {
         return new Response(null, {
           status: 304,
-          headers: corsHeaders({ "Cache-Control": "no-store" }),
+          headers: corsHeaders({
+            "Cache-Control": "no-store",
+            ...rebuildHeaders,
+          }),
         });
       }
       const object = await env.BUCKET.get(candidate.bundleKey);
       if (object) {
-        const headers = new Headers();
+        const headers = new Headers(rebuildHeaders);
         object.writeHttpMetadata(headers);
         headers.set("ETag", object.httpEtag);
         headers.set("Cache-Control", "no-store");
