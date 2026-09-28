@@ -33,7 +33,7 @@ from overturemaps.writers import get_writer
 from shapely.affinity import scale
 from shapely.geometry import LineString, MultiLineString, MultiPoint, Point, box, mapping, shape
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
+from shapely.ops import polygonize, unary_union
 from shapely.strtree import STRtree
 
 CELL_ZOOM = 20
@@ -48,8 +48,9 @@ CITY_SEARCH_RADIUS_DEGREES = 0.5
 CITY_MATCH_TOLERANCE_DEGREES = 0.002
 BOUNDARY_SIMPLIFICATION_DEGREES = 0.00002
 # Keep in sync with CURRENT_BUNDLE_REVISION in worker.js. Revision 8 names the
-# country and region each place belongs to.
-BUNDLE_REVISION = 8
+# country and region each place belongs to. Revision 9 draws neighbourhoods
+# from their named points in a place that maps no neighbourhood outlines.
+BUNDLE_REVISION = 9
 # Division subtypes that stand for the region a place is grouped under, most
 # fitting first. Countries without Overture regions, such as Slovenia, group
 # their places by the next level down instead of leaving them unnamed.
@@ -63,6 +64,21 @@ OVERPASS_ENDPOINTS = (
     "https://overpass-api.de/api/interpreter",
 )
 NEIGHBORHOOD_SUBTYPES = ("macrohood", "neighborhood", "microhood")
+# A place that maps its neighbourhoods only as named points, such as Brandon,
+# is split between those points along its main roads, rail lines and large
+# water, so the explorer's local area is a real, named neighbourhood rather
+# than a square of the exploration grid. Fewer points than this cannot cover a
+# town, so the place keeps the grid instead of a few oversized areas.
+POINT_NEIGHBORHOOD_MINIMUM = 4
+# A block with no neighbourhood point of its own joins the nearest one only
+# this close, so farmland and industry at a town's edge are left to the grid.
+POINT_NEIGHBORHOOD_REACH_METERS = 1_500.0
+# Water at least this large cuts neighbourhoods apart, the way a river does.
+POINT_NEIGHBORHOOD_WATER_CUT_SQUARE_METERS = 50_000.0
+# Roads and railways that bound neighbourhoods.
+BOUNDARY_HIGHWAYS = frozenset({"motorway", "trunk", "primary", "secondary", "tertiary"})
+BOUNDARY_RAILWAYS = frozenset({"rail", "light_rail"})
+METERS_PER_DEGREE = 111_320.0
 # Settlements that split a place with no mapped subdivisions, such as the
 # villages of a Romanian commune. Hamlets are left out, because a hamlet's
 # share would cut a village's fields in two.
@@ -175,6 +191,7 @@ def main() -> None:
             NEIGHBORHOOD_SUBTYPES,
             maximum=250,
         )
+        settlements: list[dict[str, Any]] = []
         if not districts:
             settlements = settlement_areas(city_feature, city_geometry, hierarchy)
             districts = settlements or [synthetic_district(city_feature)]
@@ -197,8 +214,16 @@ def main() -> None:
             lakes = pool.submit(
                 download_water, coverage_geometry.bounds, work / "water.geojson"
             )
-            roads = streets.result()
+            roads, boundaries = streets.result()
             water = lakes.result()
+        if not neighborhoods:
+            # No outline and no settlement splits the place, so its named
+            # neighbourhood points stand for its local areas when it has them.
+            neighborhoods = point_neighborhoods(
+                hierarchy, city_geometry, boundaries, water
+            )
+            if not PUBLIC_LOG:
+                print(f"Neighbourhoods drawn from named points: {len(neighborhoods)}")
         bundle = make_bundle(
             release=release,
             city=city_feature,
@@ -912,12 +937,17 @@ def ring_square_meters(coordinates: Iterable[tuple[float, ...]]) -> float:
 
 def download_named_roads(
     city_geometry: BaseGeometry,
-) -> list[tuple[str, BaseGeometry]]:
+) -> tuple[list[tuple[str, BaseGeometry]], list[BaseGeometry]]:
+    """The place's named streets, and the main roads and railways that bound
+    its neighbourhoods, from one Overpass read."""
     west, south, east, north = city_geometry.bounds
+    box_filter = f"({south:.8f},{west:.8f},{north:.8f},{east:.8f})"
+    railways = "|".join(sorted(BOUNDARY_RAILWAYS))
     query = (
         f"[out:json][timeout:{OVERPASS_QUERY_TIMEOUT_SECONDS}];"
-        f'way({south:.8f},{west:.8f},{north:.8f},{east:.8f})'
-        '["highway"]["name"];out tags geom;'
+        f'(way{box_filter}["highway"]["name"];'
+        f'way{box_filter}["railway"~"^({railways})$"];);'
+        "out tags geom;"
     )
     encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
     failure: Exception | None = None
@@ -947,7 +977,7 @@ def download_named_roads(
             roads = named_roads(elements, city_geometry)
             if not roads:
                 raise RuntimeError("Overpass returned no named roads for the city")
-            return roads
+            return roads, boundary_lines(elements, city_geometry)
         except (OSError, ValueError, RuntimeError) as error:
             failure = error
     raise RuntimeError("Every Overpass street endpoint failed") from failure
@@ -961,7 +991,8 @@ def named_roads(
         if not isinstance(element, dict) or element.get("type") != "way":
             continue
         tags = element.get("tags") or {}
-        if not isinstance(tags, dict):
+        if not isinstance(tags, dict) or not tags.get("highway"):
+            # Railways share the read only to bound neighbourhoods.
             continue
         name = normalize_name(str(tags.get("name") or ""))
         if not name:
@@ -985,6 +1016,164 @@ def named_roads(
         if not clipped.is_empty:
             roads.append((name, clipped))
     return roads
+
+
+def way_line(element: dict[str, Any]) -> LineString | None:
+    raw_geometry = element.get("geometry")
+    if not isinstance(raw_geometry, list):
+        return None
+    points = [
+        (point.get("lon"), point.get("lat"))
+        for point in raw_geometry
+        if isinstance(point, dict)
+        and isinstance(point.get("lat"), (int, float))
+        and isinstance(point.get("lon"), (int, float))
+    ]
+    return LineString(points) if len(points) >= 2 else None
+
+
+def boundary_lines(
+    elements: Iterable[dict[str, Any]], city_geometry: BaseGeometry
+) -> list[BaseGeometry]:
+    """Main roads and railways across the place, which bound neighbourhoods.
+
+    Sidings, yards and spurs carry a service tag and are left out, as are
+    ramps, which only join the roads they belong to.
+    """
+    lines: list[BaseGeometry] = []
+    for element in elements:
+        if not isinstance(element, dict) or element.get("type") != "way":
+            continue
+        tags = element.get("tags") or {}
+        if not isinstance(tags, dict):
+            continue
+        bounding = tags.get("highway") in BOUNDARY_HIGHWAYS or (
+            tags.get("railway") in BOUNDARY_RAILWAYS and not tags.get("service")
+        )
+        if not bounding:
+            continue
+        line = way_line(element)
+        if line is not None and line.intersects(city_geometry):
+            lines.append(line)
+    return lines
+
+
+def point_neighborhoods(
+    divisions: Iterable[dict[str, Any]],
+    city_geometry: BaseGeometry,
+    boundaries: Iterable[BaseGeometry],
+    water: BaseGeometry | None,
+) -> list[dict[str, Any]]:
+    """Neighbourhood areas drawn from the named neighbourhood points of a place
+    that maps no neighbourhood outlines.
+
+    Main roads, railways, large water and the place's own outline cut it into
+    blocks. A block holding one point belongs to that neighbourhood, a block
+    holding several is shared between them by distance, and a block holding
+    none joins the nearest point within reach. Each area keeps its point's
+    Overture ID, so a rebuild names the same ground the same way.
+    """
+    points: list[tuple[dict[str, Any], BaseGeometry]] = []
+    seen: set[str] = set()
+    for feature in divisions:
+        properties = feature.get("properties") or {}
+        feature_key = str(feature.get("id") or "")
+        if (
+            properties.get("subtype") != "neighborhood"
+            or not primary_name(properties)
+            or not feature_key
+            or feature_key in seen
+        ):
+            continue
+        geometry = valid_geometry(feature, required=False)
+        if (
+            geometry is None
+            or geometry.geom_type != "Point"
+            or not city_geometry.contains(geometry)
+        ):
+            continue
+        seen.add(feature_key)
+        points.append((feature, geometry))
+    if len(points) < POINT_NEIGHBORHOOD_MINIMUM:
+        return []
+
+    # Distances are measured in metres on a local plane around the place.
+    x_meters = math.cos(math.radians(city_geometry.centroid.y)) * METERS_PER_DEGREE
+
+    def to_meters(geometry: BaseGeometry) -> BaseGeometry:
+        return scale(geometry, xfact=x_meters, yfact=METERS_PER_DEGREE, origin=(0, 0))
+
+    def to_degrees(geometry: BaseGeometry) -> BaseGeometry:
+        return scale(
+            geometry, xfact=1 / x_meters, yfact=1 / METERS_PER_DEGREE, origin=(0, 0)
+        )
+
+    city = to_meters(city_geometry)
+    cuts: list[BaseGeometry] = [city.boundary]
+    cuts.extend(to_meters(line).intersection(city) for line in boundaries)
+    if water is not None:
+        for polygon in polygons_of(water):
+            if (
+                polygon.intersects(city_geometry)
+                and polygon_square_meters(polygon)
+                >= POINT_NEIGHBORHOOD_WATER_CUT_SQUARE_METERS
+            ):
+                cuts.append(to_meters(polygon).boundary.intersection(city))
+    blocks = [
+        block
+        for block in polygonize(unary_union([cut for cut in cuts if not cut.is_empty]))
+        if city.contains(block.representative_point())
+    ]
+
+    anchors = [to_meters(point) for _, point in points]
+    tree = STRtree(anchors)
+    parts: list[list[BaseGeometry]] = [[] for _ in points]
+    for block in blocks:
+        inside = sorted(int(index) for index in tree.query(block, predicate="contains"))
+        if len(inside) == 1:
+            parts[inside[0]].append(block)
+        elif inside:
+            cells = shapely.voronoi_polygons(
+                MultiPoint([anchors[index] for index in inside]), extend_to=block
+            )
+            for cell in cells.geoms:
+                owner = next(
+                    (index for index in inside if cell.contains(anchors[index])), None
+                )
+                piece = cell.intersection(block)
+                if owner is not None and not piece.is_empty:
+                    parts[owner].append(piece)
+        else:
+            center = block.representative_point()
+            nearest = int(tree.nearest(center))
+            if anchors[nearest].distance(center) <= POINT_NEIGHBORHOOD_REACH_METERS:
+                parts[nearest].append(block)
+
+    areas: list[dict[str, Any]] = []
+    for (feature, _), pieces in zip(points, parts):
+        if not pieces:
+            continue
+        shape_ = to_degrees(unary_union(pieces)).intersection(city_geometry)
+        polygons = list(polygons_of(shape_))
+        if not polygons:
+            continue
+        properties = feature.get("properties") or {}
+        areas.append(
+            {
+                "type": "Feature",
+                "id": feature["id"],
+                "properties": {
+                    "names": properties.get("names"),
+                    "subtype": "neighborhood",
+                    # Drawn from a point, so its edges follow roads rather
+                    # than a surveyed boundary.
+                    "drawn_from_point": True,
+                },
+                "geometry": mapping(unary_union(polygons)),
+            }
+        )
+    areas.sort(key=lambda area: (primary_name(area["properties"]), area["id"]))
+    return areas[:250]
 
 
 def make_bundle(
