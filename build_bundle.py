@@ -217,6 +217,9 @@ NEARBY_PLACES_MAXIMUM = 12
 # nothing that could place the explorer who asked: no coordinates, no search
 # box, no place names, and an error only by its type.
 PUBLIC_LOG = False
+# Id of the stored request a worker build is for, so a failed build can
+# delete the request, and the coordinate in it, as a published one does.
+REQUEST_ID: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -259,10 +262,11 @@ def load_request(request_id: str) -> tuple[float, float, str]:
 
 
 def main() -> None:
-    global PUBLIC_LOG
+    global PUBLIC_LOG, REQUEST_ID
     args = parse_args()
     if args.request_id is not None:
         PUBLIC_LOG = True
+        REQUEST_ID = args.request_id
         args.latitude, args.longitude, args.request_key = load_request(args.request_id)
     validate_coordinate(args.latitude, args.longitude)
     release = latest_release()
@@ -2264,6 +2268,25 @@ def list_objects(client: Any, bucket_name: str, prefix: str) -> Iterable[tuple[s
             yield entry["Key"], entry["LastModified"]
 
 
+def forget_failed_request(request_id: str | None) -> None:
+    """Deletes the stored request of a build that failed.
+
+    A published build deletes it, but a failed one left it, and with it the
+    explorer's coordinate, in the bucket for good. The request's marker is
+    kept, so the worker still waits out its cooldown instead of starting a
+    build on every retry of the app.
+    """
+    if request_id is None or not re.fullmatch(r"[0-9a-f-]{36}", request_id):
+        return
+    try:
+        r2_client().delete_object(
+            Bucket=required_environment("R2_BUCKET"),
+            Key=f"requests/by-id/{request_id}.json",
+        )
+    except Exception as error:
+        print(f"Request cleanup failed: {type(error).__name__}")
+
+
 def r2_client() -> Any:
     account_id = required_environment("R2_ACCOUNT_ID")
     return boto3.client(
@@ -2388,4 +2411,5 @@ if __name__ == "__main__":
             raise
         # A traceback can carry the search box or a place name.
         print(f"Build failed: {type(error).__name__}")
+        forget_failed_request(REQUEST_ID)
         sys.exit(1)

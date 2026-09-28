@@ -30,7 +30,9 @@ This repository is public so that GitHub Actions minutes cost nothing, which
 makes its run logs public too. The Worker therefore never passes a coordinate
 to the workflow. It stores the request in the private bucket under a random id
 and passes only that id. Builds started that way print no coordinate, search
-box, or place name, and report a failure only by its error type.
+box, or place name, and report a failure only by its error type. The stored
+request is deleted when the build ends, whether it published a bundle or
+failed.
 
 ## One-time setup
 
