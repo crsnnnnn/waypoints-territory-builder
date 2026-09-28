@@ -32,8 +32,8 @@ export default {
       return json({ error: "not_found" }, 404);
     }
 
-    const latitude = Number(url.searchParams.get("lat"));
-    const longitude = Number(url.searchParams.get("lon"));
+    const latitude = coordinateParameter(url.searchParams.get("lat"));
+    const longitude = coordinateParameter(url.searchParams.get("lon"));
     if (!validCoordinate(latitude, longitude)) {
       return json({ error: "invalid_coordinate" }, 400);
     }
@@ -274,6 +274,12 @@ function tileForCoordinate(latitude, longitude, zoom) {
     ),
   );
   return { x, y };
+}
+
+// Number() reads a missing or blank parameter as 0, which turned a request
+// without a coordinate into a build for 0, 0, where no city exists.
+function coordinateParameter(value) {
+  return value === null || value.trim() === "" ? Number.NaN : Number(value);
 }
 
 function validCoordinate(latitude, longitude) {

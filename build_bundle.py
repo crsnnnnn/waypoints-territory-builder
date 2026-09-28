@@ -2106,6 +2106,9 @@ def publish_bundle(
     city_key = safe_key(feature_id(city_feature))
     version = bundle["datasetVersion"]
     bundle_key = f"bundles/{city_key}/{version}.json.gz"
+    # Read before the manifest is replaced, so the lookup tiles the city no
+    # longer covers can be removed once the new bundle is published.
+    previous_tiles = published_index_tiles(client, bucket_name, city_key)
     encoded = json.dumps(bundle, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     client.put_object(
         Bucket=bucket_name,
@@ -2158,6 +2161,7 @@ def publish_bundle(
         "latitude": representative[0],
         "longitude": representative[1],
         "updatedAt": int(time.time() * 1000),
+        "tiles": [[x, y] for x, y in tiles],
     }
     client.put_object(
         Bucket=bucket_name,
@@ -2170,6 +2174,94 @@ def publish_bundle(
         client.delete_object(Bucket=bucket_name, Key=f"requests/{request_key}.json")
     if request_id:
         client.delete_object(Bucket=bucket_name, Key=f"requests/by-id/{request_id}.json")
+    remove_superseded(
+        client,
+        bucket_name,
+        city_key=city_key,
+        bundle_key=bundle_key,
+        tiles=set(tiles),
+        previous_tiles=previous_tiles,
+    )
+
+
+def published_index_tiles(
+    client: Any, bucket_name: str, city_key: str
+) -> set[tuple[int, int]]:
+    """Lookup tiles the city's published bundle is indexed under.
+
+    The manifest lists them. A manifest written before it did is read from
+    the index instead, by listing it once for the city's entries.
+    """
+    manifest = read_json_object(client, bucket_name, f"manifests/{city_key}.json")
+    if manifest is None:
+        return set()
+    listed = manifest.get("tiles")
+    if isinstance(listed, list):
+        return {(int(x), int(y)) for x, y in listed}
+    suffix = f"/{city_key}.json"
+    tiles: set[tuple[int, int]] = set()
+    for key, _ in list_objects(client, bucket_name, f"index/{INDEX_ZOOM}/"):
+        if key.endswith(suffix):
+            _, _, x, y, _ = key.split("/")
+            tiles.add((int(x), int(y)))
+    return tiles
+
+
+def remove_superseded(
+    client: Any,
+    bucket_name: str,
+    *,
+    city_key: str,
+    bundle_key: str,
+    tiles: set[tuple[int, int]],
+    previous_tiles: set[tuple[int, int]],
+) -> None:
+    """Deletes the city's older bundles and the lookup tiles it left.
+
+    Every rebuild writes a new bundle beside the old ones, so without this the
+    bucket grew by the whole set of bundles every 35 days and on every
+    revision. Only the build whose bundle the manifest names cleans up, and
+    only bundles written before its own, so two builds of one city finishing
+    together never delete the bundle the other one indexed.
+    """
+    manifest = read_json_object(client, bucket_name, f"manifests/{city_key}.json")
+    if manifest is None or manifest.get("bundleKey") != bundle_key:
+        return
+    bundles = dict(list_objects(client, bucket_name, f"bundles/{city_key}/"))
+    published_at = bundles.get(bundle_key)
+    if published_at is None:
+        return
+    keys = [
+        key
+        for key, modified in bundles.items()
+        if key != bundle_key and modified < published_at
+    ]
+    keys.extend(
+        f"index/{INDEX_ZOOM}/{x}/{y}/{city_key}.json"
+        for x, y in sorted(previous_tiles - tiles)
+    )
+    # A build leaves a few keys at most, and single deletes are the call the
+    # builder already makes against R2.
+    for key in keys:
+        client.delete_object(Bucket=bucket_name, Key=key)
+
+
+def read_json_object(client: Any, bucket_name: str, key: str) -> dict[str, Any] | None:
+    try:
+        response = client.get_object(Bucket=bucket_name, Key=key)
+    except client.exceptions.NoSuchKey:
+        return None
+    value = json.loads(response["Body"].read())
+    return value if isinstance(value, dict) else None
+
+
+def list_objects(client: Any, bucket_name: str, prefix: str) -> Iterable[tuple[str, Any]]:
+    """Key and last modified time of every object under [prefix]."""
+    for page in client.get_paginator("list_objects_v2").paginate(
+        Bucket=bucket_name, Prefix=prefix
+    ):
+        for entry in page.get("Contents", []):
+            yield entry["Key"], entry["LastModified"]
 
 
 def r2_client() -> Any:
