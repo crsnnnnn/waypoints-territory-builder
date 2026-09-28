@@ -84,10 +84,13 @@ POINT_NEIGHBORHOOD_MINIMUM = 4
 # OpenStreetMap tags as a neighbourhood, such as Cupertino's 160 m2 Olive
 # Court, not an area to explore, so it is left out.
 NEIGHBORHOOD_MINIMUM_SQUARE_METERS = 50_000.0
-# Local areas a bundle carries at most. The app measures every area of the
-# place on each newly explored cell, so filling open ground never adds areas
-# past this, and a place its outlines already fill to it keeps its gaps.
-MAXIMUM_AREAS = 250
+# Local areas a bundle carries at most, so filling open ground never adds
+# areas past this, and a place its outlines already fill to it keeps its gaps.
+# The app used to count every area again on each newly explored cell, which
+# held this at 250. It now counts only the areas a new cell reaches, about
+# 0.3 ms a cell for 500 areas, so large cities such as Calgary, whose outlines
+# alone reach 250, have room to fill their gaps.
+MAXIMUM_AREAS = 500
 # Ground no neighbourhood reaches is cut along main roads into areas about
 # this large, or larger when the budget of areas runs short.
 ROAD_AREA_TARGET_SQUARE_METERS = 1_000_000.0
