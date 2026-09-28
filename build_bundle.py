@@ -50,7 +50,9 @@ BOUNDARY_SIMPLIFICATION_DEGREES = 0.00002
 # Keep in sync with CURRENT_BUNDLE_REVISION in worker.js. Revision 8 names the
 # country and region each place belongs to. Revision 9 draws neighbourhoods
 # from their named points in a place that maps no neighbourhood outlines.
-BUNDLE_REVISION = 9
+# Revision 10 ignores outlines too small to be a neighbourhood and fills a
+# place its outlines barely cover from its named points.
+BUNDLE_REVISION = 10
 # Division subtypes that stand for the region a place is grouped under, most
 # fitting first. Countries without Overture regions, such as Slovenia, group
 # their places by the next level down instead of leaving them unnamed.
@@ -70,6 +72,13 @@ NEIGHBORHOOD_SUBTYPES = ("macrohood", "neighborhood", "microhood")
 # than a square of the exploration grid. Fewer points than this cannot cover a
 # town, so the place keeps the grid instead of a few oversized areas.
 POINT_NEIGHBORHOOD_MINIMUM = 4
+# An outline smaller than this is a plaza, courtyard or campus quad that
+# OpenStreetMap tags as a neighbourhood, such as Cupertino's 160 m2 Olive
+# Court, not an area to explore, so it is left out.
+NEIGHBORHOOD_MINIMUM_SQUARE_METERS = 50_000.0
+# Outlines covering less of a place than this leave it to its named points,
+# which fill the ground the outlines leave open.
+OUTLINE_COVERAGE_MINIMUM = 0.5
 # A block with no neighbourhood point of its own joins the nearest one only
 # this close, so farmland and industry at a town's edge are left to the grid.
 POINT_NEIGHBORHOOD_REACH_METERS = 1_500.0
@@ -185,12 +194,20 @@ def main() -> None:
             )
         districts = place_parts(divisions, hierarchy, city_feature, city_geometry)
         nearby = nearby_places(search_areas, hierarchy, city_feature, city_geometry)
-        neighborhoods = select_areas(
-            divisions,
-            city_geometry,
-            NEIGHBORHOOD_SUBTYPES,
-            maximum=250,
-        )
+        neighborhoods = [
+            area
+            for area in select_areas(
+                divisions,
+                city_geometry,
+                NEIGHBORHOOD_SUBTYPES,
+                maximum=250,
+            )
+            if square_meters_within(valid_geometry(area), city_geometry)
+            >= NEIGHBORHOOD_MINIMUM_SQUARE_METERS
+        ]
+        # Ground no outline covers, which named points may fill when the
+        # outlines cover too little of the place.
+        open_ground = open_neighborhood_ground(city_geometry, neighborhoods)
         settlements: list[dict[str, Any]] = []
         if not districts:
             settlements = settlement_areas(city_feature, city_geometry, hierarchy)
@@ -216,14 +233,13 @@ def main() -> None:
             )
             roads, boundaries = streets.result()
             water = lakes.result()
-        if not neighborhoods:
-            # No outline and no settlement splits the place, so its named
-            # neighbourhood points stand for its local areas when it has them.
-            neighborhoods = point_neighborhoods(
-                hierarchy, city_geometry, boundaries, water
-            )
+        if not settlements and open_ground is not None:
+            # No settlement splits the place and its outlines cover little of
+            # it, so its named neighbourhood points fill the open ground.
+            drawn = point_neighborhoods(hierarchy, open_ground, boundaries, water)
+            neighborhoods = [*neighborhoods, *drawn]
             if not PUBLIC_LOG:
-                print(f"Neighbourhoods drawn from named points: {len(neighborhoods)}")
+                print(f"Neighbourhoods drawn from named points: {len(drawn)}")
         bundle = make_bundle(
             release=release,
             city=city_feature,
@@ -1058,14 +1074,39 @@ def boundary_lines(
     return lines
 
 
+def square_meters_within(geometry: BaseGeometry, place: BaseGeometry) -> float:
+    return sum(
+        polygon_square_meters(polygon)
+        for polygon in polygons_of(geometry.intersection(place))
+    )
+
+
+def open_neighborhood_ground(
+    city_geometry: BaseGeometry, outlines: list[dict[str, Any]]
+) -> BaseGeometry | None:
+    """The part of the place its outlines leave open, or None when they cover
+    at least OUTLINE_COVERAGE_MINIMUM of it and it needs nothing drawn."""
+    if not outlines:
+        return city_geometry
+    covered = unary_union([valid_geometry(area) for area in outlines])
+    place_area = square_meters_within(city_geometry, city_geometry)
+    if place_area <= 0:
+        return None
+    share = square_meters_within(covered, city_geometry) / place_area
+    if share >= OUTLINE_COVERAGE_MINIMUM:
+        return None
+    open_ground = city_geometry.difference(covered)
+    return None if open_ground.is_empty else open_ground
+
+
 def point_neighborhoods(
     divisions: Iterable[dict[str, Any]],
     city_geometry: BaseGeometry,
     boundaries: Iterable[BaseGeometry],
     water: BaseGeometry | None,
 ) -> list[dict[str, Any]]:
-    """Neighbourhood areas drawn from the named neighbourhood points of a place
-    that maps no neighbourhood outlines.
+    """Neighbourhood areas drawn from the named neighbourhood points in
+    [city_geometry], the ground of a place that no outline covers.
 
     Main roads, railways, large water and the place's own outline cut it into
     blocks. A block holding one point belongs to that neighbourhood, a block

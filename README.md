@@ -11,9 +11,11 @@ covers it, the Worker starts this repository's workflow once for that zoom-12
 lookup tile. The builder reads boundaries from the latest Overture release and
 named streets from OpenStreetMap, projects the streets onto the app's zoom-20
 exploration grid, uploads the bundle to R2, and indexes it for the whole city.
-A place that maps its neighbourhoods only as named points, with no outlines,
-is split between those points along its main roads, rail lines and large
-water, so its explorers still get named local areas. Bundles older than 35 days, or built under an older revision, keep being
+Outlines under 5 ha, such as plazas tagged as neighbourhoods, are left out.
+Where the remaining outlines cover less than half a place, the ground they
+leave open is split between the place's named neighbourhood points along its
+main roads, rail lines and large water, so its explorers still get named
+local areas. Bundles older than 35 days, or built under an older revision, keep being
 served while a fresh one builds in the background.
 
 ## Privacy of public logs
