@@ -29,15 +29,28 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Set up Python
+        id: python
         # actions/setup-python v6, pinned for the same reason.
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.13'
-          cache: pip
-          cache-dependency-path: requirements.txt
+
+      # A build is waited on by an explorer holding the app open, so the
+      # installed packages are restored whole instead of installed on every
+      # run, which took about eight seconds.
+      - name: Restore territory builder packages
+        id: packages
+        # actions/cache v6.1.0, pinned for the same reason.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.venv-territory
+          key: territory-venv-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}
 
       - name: Install territory builder
-        run: pip install --requirement requirements.txt
+        if: steps.packages.outputs.cache-hit != 'true'
+        run: |
+          python -m venv ~/.venv-territory
+          ~/.venv-territory/bin/pip install --requirement requirements.txt
 
       - name: Build and publish bundle
         env:
@@ -46,4 +59,4 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: waypoints-territory-bundles
           REQUEST_ID: ${{ inputs.request_id }}
-        run: python build_bundle.py --request-id "$REQUEST_ID"
+        run: ~/.venv-territory/bin/python build_bundle.py --request-id "$REQUEST_ID"

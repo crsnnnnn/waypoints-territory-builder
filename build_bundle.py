@@ -4,23 +4,32 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import gzip
 import hashlib
+import io
 import json
 import math
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
 import boto3
+import pyarrow
+import pyarrow.compute
+import pyarrow.dataset
+import pyarrow.fs
+import pyarrow.parquet
 import shapely
+from overturemaps.core import geoarrow_schema_adapter, type_theme_map as OVERTURE_THEMES
+from overturemaps.writers import get_writer
 from shapely.affinity import scale
 from shapely.geometry import LineString, MultiLineString, MultiPoint, Point, box, mapping, shape
 from shapely.geometry.base import BaseGeometry
@@ -150,8 +159,14 @@ def main() -> None:
         city_geometry = valid_geometry(city_feature)
         city_bounds = tuple(city_geometry.bounds)
 
-        divisions = download_features("division_area", city_bounds, work / "divisions.geojson")
-        divisions = deduplicate_divisions(divisions)
+        if contains_bounds(city_search_bounds(args.latitude, args.longitude), city_bounds):
+            # The search already read every area around the place, so the
+            # place's own areas are picked from it instead of read again.
+            divisions = features_within(search_areas, city_bounds)
+        else:
+            divisions = deduplicate_divisions(
+                download_features("division_area", city_bounds, work / "divisions.geojson")
+            )
         districts = place_parts(divisions, hierarchy, city_feature, city_geometry)
         nearby = nearby_places(search_areas, hierarchy, city_feature, city_geometry)
         neighborhoods = select_areas(
@@ -175,8 +190,15 @@ def main() -> None:
                 *(valid_geometry(area) for area in neighborhoods),
             ]
         )
-        roads = download_named_roads(coverage_geometry)
-        water = download_water(coverage_geometry.bounds, work / "water.geojson")
+        # Streets come from Overpass and water from Overture, so both are
+        # read at once.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            streets = pool.submit(download_named_roads, coverage_geometry)
+            lakes = pool.submit(
+                download_water, coverage_geometry.bounds, work / "water.geojson"
+            )
+            roads = streets.result()
+            water = lakes.result()
         bundle = make_bundle(
             release=release,
             city=city_feature,
@@ -209,6 +231,7 @@ def validate_coordinate(latitude: float, longitude: float) -> None:
         raise ValueError("Coordinate is outside the valid latitude or longitude range")
 
 
+@functools.cache
 def latest_release() -> str:
     with urllib.request.urlopen(
         "https://stac.overturemaps.org/catalog.json", timeout=30
@@ -231,21 +254,18 @@ def find_city(
     places are picked from, and the division records, which carry the class
     of each settlement.
     """
-    radius = CITY_SEARCH_RADIUS_DEGREES
-    bounds = (
-        max(-180.0, longitude - radius),
-        max(-90.0, latitude - radius),
-        min(180.0, longitude + radius),
-        min(90.0, latitude + radius),
-    )
-    features = deduplicate_divisions(
-        download_features("division_area", bounds, work / "city-search.geojson")
-    )
-    divisions = download_features(
-        "division",
-        bounds,
-        work / "city-hierarchy.geojson",
-    )
+    bounds = city_search_bounds(latitude, longitude)
+    # The areas and the division records are separate reads, so they run
+    # side by side.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        areas = pool.submit(
+            download_features, "division_area", bounds, work / "city-search.geojson"
+        )
+        records = pool.submit(
+            download_features, "division", bounds, work / "city-hierarchy.geojson"
+        )
+        features = deduplicate_divisions(areas.result())
+        divisions = records.result()
     point = Point(longitude, latitude)
     for tolerance in (0.0, CITY_MATCH_TOLERANCE_DEGREES):
         match = choose_place(features, divisions, point, tolerance)
@@ -341,6 +361,31 @@ def choose_place(
     return candidates[0][4]
 
 
+def city_search_bounds(
+    latitude: float, longitude: float
+) -> tuple[float, float, float, float]:
+    """The box the place and its neighbours are searched for in."""
+    radius = CITY_SEARCH_RADIUS_DEGREES
+    return (
+        max(-180.0, longitude - radius),
+        max(-90.0, latitude - radius),
+        min(180.0, longitude + radius),
+        min(90.0, latitude + radius),
+    )
+
+
+def contains_bounds(
+    outer: tuple[float, float, float, float],
+    inner: tuple[float, float, float, float],
+) -> bool:
+    return (
+        outer[0] <= inner[0]
+        and outer[1] <= inner[1]
+        and outer[2] >= inner[2]
+        and outer[3] >= inner[3]
+    )
+
+
 def download_features(
     feature_type: str,
     bounds: tuple[float, float, float, float],
@@ -348,37 +393,137 @@ def download_features(
     *,
     allow_empty: bool = False,
 ) -> list[dict[str, Any]]:
-    bbox = ",".join(f"{value:.8f}" for value in bounds)
-    subprocess.run(
-        [
-            "overturemaps",
-            "download",
-            f"--bbox={bbox}",
-            "-f",
-            "geojson",
-            f"--type={feature_type}",
-            # The STAC file index in overturemaps 1.0.2 matches no files for
-            # current releases, so the CLI writes nothing and still exits 0.
-            "--no-stac",
-            "-o",
-            str(output),
-        ],
-        check=True,
-        # The CLI can echo its arguments, the search box among them.
-        stdout=subprocess.DEVNULL if PUBLIC_LOG else None,
-        stderr=subprocess.DEVNULL if PUBLIC_LOG else None,
+    """Overture features of one type whose bounding box meets [bounds].
+
+    Only the release files the Overture file index places around [bounds] are
+    read. Scanning the whole type instead opens the footer of every file of
+    the release and took most of a build's time.
+    """
+    release = latest_release()
+    files = overture_files(release, feature_type, bounds)
+    source = (
+        files
+        if files is not None
+        else f"overturemaps-us-west-2/release/{release}/theme={OVERTURE_THEMES[feature_type]}/type={feature_type}/"
     )
-    if not output.exists():
+    if files == []:
+        return []
+    xmin, ymin, xmax, ymax = bounds
+    # The same row filter the Overture CLI applies.
+    row_filter = (
+        (pyarrow.compute.field("bbox", "xmin") < xmax)
+        & (pyarrow.compute.field("bbox", "xmax") > xmin)
+        & (pyarrow.compute.field("bbox", "ymin") < ymax)
+        & (pyarrow.compute.field("bbox", "ymax") > ymin)
+    )
+    try:
+        dataset = pyarrow.dataset.dataset(
+            source,
+            filesystem=pyarrow.fs.S3FileSystem(anonymous=True, region="us-west-2"),
+        )
+        batches = dataset.to_batches(
+            filter=row_filter,
+            use_threads=True,
+            batch_readahead=16,
+            fragment_readahead=4,
+        )
+        with get_writer(
+            "geojson",
+            str(output),
+            schema=geoarrow_schema_adapter(dataset.schema),
+        ) as writer:
+            for batch in batches:
+                if batch.num_rows > 0:
+                    writer.write_batch(batch)
+    except (OSError, pyarrow.ArrowException) as error:
+        # A type that may be missing, such as water, reads as none.
         if allow_empty:
             return []
-        raise RuntimeError(
-            f"Overture {feature_type} download wrote no data for bbox {bbox}"
-        )
-    with output.open("r", encoding="utf-8") as source:
-        payload = json.load(source)
+        raise RuntimeError(f"Overture {feature_type} download failed") from error
+    with output.open("r", encoding="utf-8") as source_file:
+        payload = json.load(source_file)
     if payload.get("type") != "FeatureCollection":
         raise RuntimeError(f"Overture {feature_type} download was not GeoJSON")
-    return [feature for feature in payload.get("features", []) if isinstance(feature, dict)]
+    return [
+        feature for feature in payload.get("features", []) if isinstance(feature, dict)
+    ]
+
+
+@functools.cache
+def overture_file_index(release: str) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """Every file of [release] with its bounding box, from the Overture index.
+
+    The index no longer names each file's type in its collection field, which
+    is why the Overture CLI's own index lookup matches nothing, but every file
+    path still carries its type.
+    """
+    with urllib.request.urlopen(
+        f"https://stac.overturemaps.org/{release}/collections.parquet", timeout=30
+    ) as response:
+        table = pyarrow.parquet.read_table(io.BytesIO(response.read()))
+    files = []
+    for asset, bbox in zip(
+        table.column("assets").to_pylist(), table.column("bbox").to_pylist()
+    ):
+        href = asset["aws"]["alternate"]["s3"]["href"]
+        files.append(
+            (
+                href.removeprefix("s3://"),
+                (bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"]),
+            )
+        )
+    return files
+
+
+def overture_files(
+    release: str,
+    feature_type: str,
+    bounds: tuple[float, float, float, float],
+) -> list[str] | None:
+    """Files of [feature_type] whose bounding box meets [bounds], in path order,
+    or None when the index cannot be read and the whole type must be scanned."""
+    try:
+        index = overture_file_index(release)
+    except (OSError, ValueError, KeyError, TypeError, pyarrow.ArrowException):
+        return None
+    marker = f"/type={feature_type}/"
+    typed = [(path, box_) for path, box_ in index if marker in path]
+    if not typed:
+        return None
+    xmin, ymin, xmax, ymax = bounds
+    return sorted(
+        path
+        for path, (west, south, east, north) in typed
+        if west < xmax and east > xmin and south < ymax and north > ymin
+    )
+
+
+def features_within(
+    features: Iterable[dict[str, Any]],
+    bounds: tuple[float, float, float, float],
+) -> list[dict[str, Any]]:
+    """Features whose geometry's bounding box meets [bounds].
+
+    A small margin keeps every feature a fresh download of [bounds] would
+    return, since Overture rounds its stored boxes outward. Callers measure
+    each feature against the place's outline anyway.
+    """
+    margin = 1e-6
+    xmin, ymin, xmax, ymax = bounds
+    selected = []
+    for feature in features:
+        raw = feature.get("geometry")
+        if not raw:
+            continue
+        west, south, east, north = shape(raw).bounds
+        if (
+            west < xmax + margin
+            and east > xmin - margin
+            and south < ymax + margin
+            and north > ymin - margin
+        ):
+            selected.append(feature)
+    return selected
 
 
 def valid_geometry(

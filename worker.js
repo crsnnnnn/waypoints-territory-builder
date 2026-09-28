@@ -2,7 +2,10 @@ const INDEX_ZOOM = 12;
 const REQUEST_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const BUNDLE_REFRESH_MS = 35 * 24 * 60 * 60 * 1000;
 const DEFAULT_DAILY_BUILD_LIMIT = 25;
-const DEFAULT_RETRY_AFTER_SECONDS = 20;
+// A new city takes under a minute to build, and the app waits on it with the
+// sheet open, so it asks again soon enough to show the bundle within seconds
+// of it landing. Each ask is one small index read.
+const DEFAULT_RETRY_AFTER_SECONDS = 5;
 const REQUIRED_BUNDLE_REVISION = 6;
 // Revision the builder writes now. An older bundle that still meets the
 // required revision is served as it is and rebuilt in the background, the way
