@@ -17,7 +17,8 @@ named local area: first the place's named neighbourhood points claim the
 blocks around them, cut along main roads, rail lines and large water, then
 named land such as parks, golf courses, cemeteries, campuses and industrial
 estates claims what is left, and the rest is cut along main roads into areas
-of about 1 km2 named after their main road. A bundle carries at most 250
+of about 1 km2, each named after named land filling much of it or after the
+crossroads of its two main roads, such as "Courtney & Dewdney". A bundle carries at most 250
 areas, because the app measures each area on every newly explored cell. Bundles older than 35 days, or built under an older revision, keep being
 served while a fresh one builds in the background.
 

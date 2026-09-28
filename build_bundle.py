@@ -54,7 +54,9 @@ BOUNDARY_SIMPLIFICATION_DEGREES = 0.00002
 # place its outlines barely cover from its named points. Revision 11 fills all
 # the ground outlines leave open: named points, then named land such as parks
 # and campuses, then road-bounded areas named after their main road.
-BUNDLE_REVISION = 11
+# Revision 12 names road-bounded areas after the land filling them or their
+# crossroads, and folds areas with few streets into their neighbours.
+BUNDLE_REVISION = 12
 # Division subtypes that stand for the region a place is grouped under, most
 # fitting first. Countries without Overture regions, such as Slovenia, group
 # their places by the next level down instead of leaving them unnamed.
@@ -90,6 +92,36 @@ ROAD_AREA_TARGET_SQUARE_METERS = 1_000_000.0
 ROAD_AREA_MINIMUM_SQUARE_METERS = 20_000.0
 # Streets this close to a road-bounded area can name it.
 ROAD_AREA_NAMING_METERS = 40.0
+# A road-bounded area with fewer named streets than this joins its neighbour,
+# since a card counting two streets is not worth its own place.
+ROAD_AREA_MINIMUM_STREETS = 8
+# Only an area smaller than the target joins a neighbour for having few
+# streets, and never into an area larger than this many times the target, so
+# farmland with few streets is not swallowed into one vast area.
+ROAD_AREA_MERGE_LIMIT_FACTOR = 3.0
+# A sliver this small with few streets and nothing to join is dropped.
+ROAD_AREA_SLIVER_SQUARE_METERS = 100_000.0
+# Direction words a crossroads name leaves off the end: "Victoria Avenue East"
+# reads "Victoria", the same road as "Victoria Avenue". A leading direction
+# is often part of the name, as in West Valley Freeway, so it stays.
+DIRECTION_WORDS = frozenset(
+    {"north", "south", "east", "west", "n", "s", "e", "w", "ne", "nw", "se", "sw",
+     "northeast", "northwest", "southeast", "southwest"}
+)
+# Named land covering at least this share of a road-bounded area names it,
+# as long as the land is not far larger than the area itself.
+LANDMARK_NAMING_SHARE = 0.25
+LANDMARK_NAMING_MAXIMUM_RATIO = 4.0
+# Street type words a crossroads name leaves out, so it reads the way people
+# give directions: "Courtney & Dewdney".
+STREET_TYPE_WORDS = frozenset(
+    {
+        "street", "st", "avenue", "ave", "road", "rd", "drive", "dr",
+        "boulevard", "blvd", "way", "lane", "ln", "place", "pl", "court",
+        "ct", "crescent", "cres", "terrace", "parkway", "pkwy", "highway",
+        "hwy", "expressway", "freeway", "trail", "gate", "circle", "row",
+    }
+)
 # A block this many times the target area, such as a hillside few main roads
 # cross, is split into pieces of about the target area.
 ROAD_AREA_SPLIT_FACTOR = 3.0
@@ -1286,9 +1318,11 @@ def fill_open_ground(
         remaining = polygonal(
             remaining.difference(unary_union([valid_geometry(area) for area in points]))
         )
+    land_use = list(land_use)
     named, remaining = land_use_areas(land_use, remaining, budget - len(points))
     chunks = road_areas(
         remaining,
+        landmarks=land_use,
         boundaries=boundaries,
         roads=roads,
         road_ranks=road_ranks,
@@ -1375,9 +1409,11 @@ def road_areas(
     place_name: str,
     budget: int,
     taken: set[str],
+    landmarks: Iterable[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
-    """[ground] cut along main roads into compact areas named after their main
-    road, at most [budget] of them."""
+    """[ground] cut along main roads into compact areas, at most [budget] of
+    them, each named after the land that fills much of it, or else after the
+    crossroads of the two main roads bounding it."""
     if budget <= 0 or ground.is_empty:
         return []
     if water is not None:
@@ -1488,33 +1524,96 @@ def road_areas(
 
     road_geometries = [to_meters(geometry) for _, geometry in roads]
     road_tree = STRtree(road_geometries) if road_geometries else None
+
+    def street_names(shape: BaseGeometry) -> set[str]:
+        if road_tree is None:
+            return set()
+        return {roads[int(raw)][0] for raw in road_tree.query(shape, predicate="intersects")}
+
+    shapes = [
+        polygonal(unary_union([blocks[member] for member in group])) for group in groups
+    ]
+    # An area with too few streets joins the neighbour it shares the longest
+    # edge with, smallest first, until every area counts enough streets or
+    # has no neighbour left to join.
+    counts = [len(street_names(shape)) for shape in shapes]
+    while True:
+        small = [
+            index
+            for index, shape in enumerate(shapes)
+            if not shape.is_empty and counts[index] < ROAD_AREA_MINIMUM_STREETS
+        ]
+        merged_any = False
+        for index in sorted(small, key=lambda index: (counts[index], shapes[index].area)):
+            shape = shapes[index]
+            if (
+                shape.is_empty
+                or counts[index] >= ROAD_AREA_MINIMUM_STREETS
+                or shape.area >= target
+            ):
+                continue
+            limit = target * ROAD_AREA_MERGE_LIMIT_FACTOR
+            shared = [
+                (shape.boundary.intersection(other.boundary).length, other_index)
+                for other_index, other in enumerate(shapes)
+                if other_index != index
+                and not other.is_empty
+                and other.area + shape.area <= limit
+                and shape.touches(other)
+            ]
+            shared = [item for item in shared if item[0] > 1]
+            if not shared:
+                continue
+            _, into = max(shared)
+            shapes[into] = polygonal(unary_union([shapes[into], shape]))
+            counts[into] = len(street_names(shapes[into]))
+            shapes[index] = shapely.Polygon()
+            merged_any = True
+        if not merged_any:
+            break
+
+    landmark_shapes: list[tuple[str, BaseGeometry, float]] = []
+    for feature in landmarks:
+        name = primary_name(feature.get("properties") or {})
+        geometry = valid_geometry(feature, required=False)
+        if not name or geometry is None or geometry.geom_type not in ("Polygon", "MultiPolygon"):
+            continue
+        in_meters = polygonal(to_meters(geometry))
+        if not in_meters.is_empty:
+            landmark_shapes.append((name, in_meters, in_meters.area))
+    landmark_tree = STRtree([shape for _, shape, _ in landmark_shapes]) if landmark_shapes else None
+
     used = set(taken)
     whole_center = unary_union(blocks).centroid
     areas: list[dict[str, Any]] = []
-    for group in groups:
-        shape_meters = unary_union([blocks[member] for member in group])
+    for index, shape_meters in enumerate(shapes):
         if shape_meters.area < ROAD_AREA_MINIMUM_SQUARE_METERS:
             continue
-        reach = shape_meters.buffer(ROAD_AREA_NAMING_METERS)
-        lengths: dict[str, float] = {}
-        if road_tree is not None:
-            for raw in road_tree.query(reach, predicate="intersects"):
-                name = roads[int(raw)][0]
-                lengths[name] = lengths.get(name, 0.0) + road_geometries[int(raw)].intersection(reach).length
-        ranked = sorted(
-            lengths,
-            key=lambda name: (-road_ranks.get(name, 0), -lengths[name], name),
-        )
-        written = [f"{road_names.get(road, road)} area" for road in ranked]
-        name = next((candidate for candidate in written if candidate not in used), None)
+        if (
+            shape_meters.area < ROAD_AREA_SLIVER_SQUARE_METERS
+            and counts[index] < ROAD_AREA_MINIMUM_STREETS
+        ):
+            continue
+        name = landmark_name(shape_meters, landmark_shapes, landmark_tree, used)
         if name is None:
-            base = written[0] if written else f"{place_name} outskirts"
+            name = crossroads_name(
+                shape_meters,
+                roads=roads,
+                road_geometries=road_geometries,
+                road_tree=road_tree,
+                road_ranks=road_ranks,
+                road_names=road_names,
+                used=used,
+            )
+        base = name or f"{place_name} outskirts"
+        name = base
+        if name in used:
             # A name already taken reads with the side of the place it is on.
             name = f"{base} ({compass_word(whole_center, shape_meters.representative_point())})"
-            number = 2
-            while name in used:
-                name = f"{base} {number}"
-                number += 1
+        number = 2
+        while name in used:
+            name = f"{base} {number}"
+            number += 1
         used.add(name)
         geometry = to_degrees(shape_meters)
         center = geometry.representative_point()
@@ -1534,6 +1633,90 @@ def road_areas(
             }
         )
     return areas
+
+
+def landmark_name(
+    shape: BaseGeometry,
+    landmarks: list[tuple[str, BaseGeometry, float]],
+    tree: STRtree | None,
+    used: set[str],
+) -> str | None:
+    """The name of named land filling much of [shape], such as a park or a
+    school, or None. Land far larger than the area would misname it."""
+    if tree is None or shape.area <= 0:
+        return None
+    best: tuple[float, str] | None = None
+    for raw in tree.query(shape, predicate="intersects"):
+        name, land, size = landmarks[int(raw)]
+        if name in used or size > shape.area * LANDMARK_NAMING_MAXIMUM_RATIO:
+            continue
+        share = land.intersection(shape).area / shape.area
+        if share >= LANDMARK_NAMING_SHARE and (best is None or share > best[0]):
+            best = (share, name)
+    return best[1] if best else None
+
+
+def short_street_name(written: str) -> str:
+    """[written] without its street type word, as people give directions:
+    "Courtney Street" reads "Courtney". A name the type word is needed for,
+    such as "Ring Road", keeps it."""
+    def keeps(rest: list[str]) -> bool:
+        text = " ".join(rest)
+        return bool(rest) and (
+            len(rest) > 1 or any(character.isdigit() for character in text) or len(text) >= 5
+        )
+
+    def word(value: str) -> str:
+        return value.lower().rstrip(".")
+
+    words = written.split()
+    if len(words) > 1 and word(words[-1]) in DIRECTION_WORDS and keeps(words[:-1]):
+        words = words[:-1]
+    if len(words) > 1 and word(words[-1]) in STREET_TYPE_WORDS and keeps(words[:-1]):
+        words = words[:-1]
+    return " ".join(words)
+
+
+def crossroads_name(
+    shape: BaseGeometry,
+    *,
+    roads: list[tuple[str, BaseGeometry]],
+    road_geometries: list[BaseGeometry],
+    road_tree: STRtree | None,
+    road_ranks: dict[str, int],
+    road_names: dict[str, str],
+    used: set[str],
+) -> str | None:
+    """"Courtney & Dewdney": the two main roads along [shape]'s edge, or the
+    next pair when that name is taken. One road alone reads "Near Courtney
+    Street". None when no named road reaches the area."""
+    if road_tree is None:
+        return None
+    edge = shape.boundary.buffer(ROAD_AREA_NAMING_METERS)
+    lengths: dict[str, float] = {}
+    for raw in road_tree.query(edge, predicate="intersects"):
+        name = roads[int(raw)][0]
+        lengths[name] = lengths.get(name, 0.0) + road_geometries[int(raw)].intersection(edge).length
+    ranked = sorted(lengths, key=lambda name: (-road_ranks.get(name, 0), -lengths[name], name))
+    short = []
+    for name in ranked:
+        word = short_street_name(road_names.get(name, name))
+        if word not in short:
+            short.append(word)
+    candidates = [
+        f"{short[first]} & {short[second]}"
+        for total in range(1, len(short) * 2)
+        for first in range(len(short))
+        for second in range(first + 1, len(short))
+        if first + second == total
+    ]
+    for candidate in candidates:
+        if candidate not in used:
+            return candidate
+    if short:
+        single = f"Near {road_names.get(ranked[0], ranked[0])}"
+        return single if single not in used else candidates[0] if candidates else None
+    return None
 
 
 def point_neighborhoods(
