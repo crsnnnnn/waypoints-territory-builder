@@ -12,10 +12,13 @@ lookup tile. The builder reads boundaries from the latest Overture release and
 named streets from OpenStreetMap, projects the streets onto the app's zoom-20
 exploration grid, uploads the bundle to R2, and indexes it for the whole city.
 Outlines under 5 ha, such as plazas tagged as neighbourhoods, are left out.
-Where the remaining outlines cover less than half a place, the ground they
-leave open is split between the place's named neighbourhood points along its
-main roads, rail lines and large water, so its explorers still get named
-local areas. Bundles older than 35 days, or built under an older revision, keep being
+The ground the outlines leave open is filled so every part of a place has a
+named local area: first the place's named neighbourhood points claim the
+blocks around them, cut along main roads, rail lines and large water, then
+named land such as parks, golf courses, cemeteries, campuses and industrial
+estates claims what is left, and the rest is cut along main roads into areas
+of about 1 km2 named after their main road. A bundle carries at most 250
+areas, because the app measures each area on every newly explored cell. Bundles older than 35 days, or built under an older revision, keep being
 served while a fresh one builds in the background.
 
 ## Privacy of public logs

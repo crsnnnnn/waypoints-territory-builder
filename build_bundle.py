@@ -51,8 +51,10 @@ BOUNDARY_SIMPLIFICATION_DEGREES = 0.00002
 # country and region each place belongs to. Revision 9 draws neighbourhoods
 # from their named points in a place that maps no neighbourhood outlines.
 # Revision 10 ignores outlines too small to be a neighbourhood and fills a
-# place its outlines barely cover from its named points.
-BUNDLE_REVISION = 10
+# place its outlines barely cover from its named points. Revision 11 fills all
+# the ground outlines leave open: named points, then named land such as parks
+# and campuses, then road-bounded areas named after their main road.
+BUNDLE_REVISION = 11
 # Division subtypes that stand for the region a place is grouped under, most
 # fitting first. Countries without Overture regions, such as Slovenia, group
 # their places by the next level down instead of leaving them unnamed.
@@ -76,9 +78,36 @@ POINT_NEIGHBORHOOD_MINIMUM = 4
 # OpenStreetMap tags as a neighbourhood, such as Cupertino's 160 m2 Olive
 # Court, not an area to explore, so it is left out.
 NEIGHBORHOOD_MINIMUM_SQUARE_METERS = 50_000.0
-# Outlines covering less of a place than this leave it to its named points,
-# which fill the ground the outlines leave open.
-OUTLINE_COVERAGE_MINIMUM = 0.5
+# Local areas a bundle carries at most. The app measures every area of the
+# place on each newly explored cell, so filling open ground never adds areas
+# past this, and a place its outlines already fill to it keeps its gaps.
+MAXIMUM_AREAS = 250
+# Ground no neighbourhood reaches is cut along main roads into areas about
+# this large, or larger when the budget of areas runs short.
+ROAD_AREA_TARGET_SQUARE_METERS = 1_000_000.0
+# A leftover strip smaller than this, such as a sliver between two outlines,
+# is not an area of its own.
+ROAD_AREA_MINIMUM_SQUARE_METERS = 20_000.0
+# Streets this close to a road-bounded area can name it.
+ROAD_AREA_NAMING_METERS = 40.0
+# A block this many times the target area, such as a hillside few main roads
+# cross, is split into pieces of about the target area.
+ROAD_AREA_SPLIT_FACTOR = 3.0
+# Named land of these classes is part of the neighbourhood around it rather
+# than a place to explore on its own.
+LAND_USE_EXCLUDED_CLASSES = frozenset(
+    {"school", "kindergarten", "childcare", "hospital", "clinic"}
+)
+# How strongly a road names the ground beside it, by its highway class.
+HIGHWAY_RANKS = {
+    "motorway": 7,
+    "trunk": 6,
+    "primary": 5,
+    "secondary": 4,
+    "tertiary": 3,
+    "unclassified": 2,
+    "residential": 1,
+}
 # A block with no neighbourhood point of its own joins the nearest one only
 # this close, so farmland and industry at a town's edge are left to the grid.
 POINT_NEIGHBORHOOD_REACH_METERS = 1_500.0
@@ -200,13 +229,13 @@ def main() -> None:
                 divisions,
                 city_geometry,
                 NEIGHBORHOOD_SUBTYPES,
-                maximum=250,
+                maximum=MAXIMUM_AREAS,
             )
             if square_meters_within(valid_geometry(area), city_geometry)
             >= NEIGHBORHOOD_MINIMUM_SQUARE_METERS
         ]
-        # Ground no outline covers, which named points may fill when the
-        # outlines cover too little of the place.
+        # Ground no outline covers, which the explorer should still find a
+        # named local area on.
         open_ground = open_neighborhood_ground(city_geometry, neighborhoods)
         settlements: list[dict[str, Any]] = []
         if not districts:
@@ -224,22 +253,45 @@ def main() -> None:
                 *(valid_geometry(area) for area in neighborhoods),
             ]
         )
-        # Streets come from Overpass and water from Overture, so both are
-        # read at once.
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        fill_budget = MAXIMUM_AREAS - len(neighborhoods)
+        fills = not settlements and open_ground is not None and fill_budget > 0
+        # Streets come from Overpass, water and land use from Overture, so all
+        # are read at once.
+        with ThreadPoolExecutor(max_workers=3) as pool:
             streets = pool.submit(download_named_roads, coverage_geometry)
             lakes = pool.submit(
                 download_water, coverage_geometry.bounds, work / "water.geojson"
             )
-            roads, boundaries = streets.result()
+            uses = (
+                pool.submit(
+                    download_features,
+                    "land_use",
+                    open_ground.bounds,
+                    work / "land-use.geojson",
+                    allow_empty=True,
+                )
+                if fills
+                else None
+            )
+            roads, boundaries, road_ranks, road_names = streets.result()
             water = lakes.result()
-        if not settlements and open_ground is not None:
-            # No settlement splits the place and its outlines cover little of
-            # it, so its named neighbourhood points fill the open ground.
-            drawn = point_neighborhoods(hierarchy, open_ground, boundaries, water)
+            land_use = uses.result() if uses is not None else []
+        if fills:
+            # No settlement splits the place, so the ground its outlines leave
+            # open is filled with named local areas.
+            drawn = fill_open_ground(
+                open_ground=open_ground,
+                divisions=hierarchy,
+                land_use=land_use,
+                boundaries=boundaries,
+                roads=roads,
+                road_ranks=road_ranks,
+                road_names=road_names,
+                water=water,
+                place_name=primary_name(city_feature.get("properties") or {}),
+                budget=fill_budget,
+            )
             neighborhoods = [*neighborhoods, *drawn]
-            if not PUBLIC_LOG:
-                print(f"Neighbourhoods drawn from named points: {len(drawn)}")
         bundle = make_bundle(
             release=release,
             city=city_feature,
@@ -953,9 +1005,12 @@ def ring_square_meters(coordinates: Iterable[tuple[float, ...]]) -> float:
 
 def download_named_roads(
     city_geometry: BaseGeometry,
-) -> tuple[list[tuple[str, BaseGeometry]], list[BaseGeometry]]:
-    """The place's named streets, and the main roads and railways that bound
-    its neighbourhoods, from one Overpass read."""
+) -> tuple[
+    list[tuple[str, BaseGeometry]], list[BaseGeometry], dict[str, int], dict[str, str]
+]:
+    """The place's named streets, the main roads and railways that bound its
+    neighbourhoods, each street's highway rank and the name it is written
+    with, from one Overpass read."""
     west, south, east, north = city_geometry.bounds
     box_filter = f"({south:.8f},{west:.8f},{north:.8f},{east:.8f})"
     railways = "|".join(sorted(BOUNDARY_RAILWAYS))
@@ -993,7 +1048,12 @@ def download_named_roads(
             roads = named_roads(elements, city_geometry)
             if not roads:
                 raise RuntimeError("Overpass returned no named roads for the city")
-            return roads, boundary_lines(elements, city_geometry)
+            return (
+                roads,
+                boundary_lines(elements, city_geometry),
+                highway_ranks(elements),
+                display_names(elements),
+            )
         except (OSError, ValueError, RuntimeError) as error:
             failure = error
     raise RuntimeError("Every Overpass street endpoint failed") from failure
@@ -1084,19 +1144,396 @@ def square_meters_within(geometry: BaseGeometry, place: BaseGeometry) -> float:
 def open_neighborhood_ground(
     city_geometry: BaseGeometry, outlines: list[dict[str, Any]]
 ) -> BaseGeometry | None:
-    """The part of the place its outlines leave open, or None when they cover
-    at least OUTLINE_COVERAGE_MINIMUM of it and it needs nothing drawn."""
+    """The part of the place its outlines leave open, or None when they leave
+    no ground large enough to be an area."""
     if not outlines:
         return city_geometry
     covered = unary_union([valid_geometry(area) for area in outlines])
-    place_area = square_meters_within(city_geometry, city_geometry)
-    if place_area <= 0:
+    open_ground = polygonal(city_geometry.difference(covered))
+    if square_meters_within(open_ground, city_geometry) < ROAD_AREA_MINIMUM_SQUARE_METERS:
         return None
-    share = square_meters_within(covered, city_geometry) / place_area
-    if share >= OUTLINE_COVERAGE_MINIMUM:
-        return None
-    open_ground = city_geometry.difference(covered)
-    return None if open_ground.is_empty else open_ground
+    return open_ground
+
+
+def polygonal(geometry: BaseGeometry) -> BaseGeometry:
+    """The valid polygon part of [geometry].
+
+    Subtracting one area from another can leave invalid rings and stray
+    lines, which the cutting and measuring below cannot take.
+    """
+    if geometry.is_valid and geometry.geom_type in ("Polygon", "MultiPolygon"):
+        # Already clean, and left exactly as it is, so the areas cut from it
+        # match earlier builds to the last coordinate.
+        return geometry
+    if not geometry.is_valid:
+        geometry = shapely.make_valid(geometry)
+    polygons = [polygon for polygon in polygons_of(geometry) if not polygon.is_empty]
+    if not polygons:
+        return shapely.Polygon()
+    return unary_union(polygons)
+
+
+def metric_frame(latitude: float):
+    """Converters to and from metres on a local plane around [latitude]."""
+    x_meters = math.cos(math.radians(latitude)) * METERS_PER_DEGREE
+
+    def to_meters(geometry: BaseGeometry) -> BaseGeometry:
+        return scale(geometry, xfact=x_meters, yfact=METERS_PER_DEGREE, origin=(0, 0))
+
+    def to_degrees(geometry: BaseGeometry) -> BaseGeometry:
+        return scale(
+            geometry, xfact=1 / x_meters, yfact=1 / METERS_PER_DEGREE, origin=(0, 0)
+        )
+
+    return to_meters, to_degrees
+
+
+def cut_blocks(
+    ground: BaseGeometry,
+    boundaries: Iterable[BaseGeometry],
+    water: BaseGeometry | None,
+    to_meters,
+) -> list[BaseGeometry]:
+    """[ground], in metres, cut into blocks along main roads, railways, large
+    water and its own edges."""
+    ground_meters = polygonal(to_meters(polygonal(ground)))
+    if ground_meters.is_empty:
+        return []
+    cuts: list[BaseGeometry] = [ground_meters.boundary]
+    cuts.extend(to_meters(line).intersection(ground_meters) for line in boundaries)
+    if water is not None:
+        for polygon in polygons_of(water):
+            if (
+                polygon.intersects(ground)
+                and polygon_square_meters(polygon)
+                >= POINT_NEIGHBORHOOD_WATER_CUT_SQUARE_METERS
+            ):
+                cuts.append(to_meters(polygon).boundary.intersection(ground_meters))
+    return [
+        block
+        for block in polygonize(unary_union([cut for cut in cuts if not cut.is_empty]))
+        if ground_meters.contains(block.representative_point())
+    ]
+
+
+def highway_ranks(elements: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """The highest highway rank each street name carries."""
+    ranks: dict[str, int] = {}
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        tags = element.get("tags") or {}
+        if not isinstance(tags, dict):
+            continue
+        name = normalize_name(str(tags.get("name") or ""))
+        rank = HIGHWAY_RANKS.get(str(tags.get("highway") or "").removesuffix("_link"), 0)
+        if name and rank > ranks.get(name, 0):
+            ranks[name] = rank
+    return ranks
+
+
+def display_names(elements: Iterable[dict[str, Any]]) -> dict[str, str]:
+    """The name each street is written with, keyed by its normalised name."""
+    counts: dict[str, dict[str, int]] = {}
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        tags = element.get("tags") or {}
+        if not isinstance(tags, dict) or not tags.get("highway"):
+            continue
+        written = " ".join(str(tags.get("name") or "").split())
+        name = normalize_name(written)
+        if name:
+            spellings = counts.setdefault(name, {})
+            spellings[written] = spellings.get(written, 0) + 1
+    return {
+        name: max(spellings, key=lambda written: (spellings[written], written))
+        for name, spellings in counts.items()
+    }
+
+
+def compass_word(origin: BaseGeometry, point: BaseGeometry) -> str:
+    """The direction of [point] from [origin], in metres on a local plane."""
+    angle = math.degrees(math.atan2(point.y - origin.y, point.x - origin.x))
+    words = ("east", "northeast", "north", "northwest", "west", "southwest", "south", "southeast")
+    return words[round(angle / 45) % 8]
+
+
+def fill_open_ground(
+    *,
+    open_ground: BaseGeometry,
+    divisions: Iterable[dict[str, Any]],
+    land_use: Iterable[dict[str, Any]],
+    boundaries: list[BaseGeometry],
+    roads: list[tuple[str, BaseGeometry]],
+    road_ranks: dict[str, int],
+    road_names: dict[str, str],
+    water: BaseGeometry | None,
+    place_name: str,
+    budget: int,
+) -> list[dict[str, Any]]:
+    """Named local areas for the ground no outline covers, within [budget].
+
+    Named neighbourhood points claim their road-bounded blocks first. Named
+    land such as parks, golf courses, cemeteries, campuses and industrial
+    estates claims what they leave. What is still open is cut along main roads
+    into areas named after their main road, so every part of the place large
+    enough to stand in belongs to a named area.
+    """
+    points = point_neighborhoods(divisions, open_ground, boundaries, water)[:budget]
+    remaining = open_ground
+    if points:
+        remaining = polygonal(
+            remaining.difference(unary_union([valid_geometry(area) for area in points]))
+        )
+    named, remaining = land_use_areas(land_use, remaining, budget - len(points))
+    chunks = road_areas(
+        remaining,
+        boundaries=boundaries,
+        roads=roads,
+        road_ranks=road_ranks,
+        road_names=road_names,
+        water=water,
+        place_name=place_name,
+        budget=budget - len(points) - len(named),
+        taken={primary_name(area["properties"]) for area in [*points, *named]},
+    )
+    if not PUBLIC_LOG:
+        print(
+            f"Open ground filled: {len(points)} from named points, "
+            f"{len(named)} from named land, {len(chunks)} along roads"
+        )
+    return [*points, *named, *chunks]
+
+
+def land_use_areas(
+    features: Iterable[dict[str, Any]],
+    ground: BaseGeometry,
+    budget: int,
+) -> tuple[list[dict[str, Any]], BaseGeometry]:
+    """Named land in [ground] as local areas, and the ground left after them.
+
+    The smallest land claims first, so a golf course inside a large park is
+    its own area and the park keeps the rest. A piece under 5 ha is too small
+    to explore and is left to the areas around it.
+    """
+    if budget <= 0 or ground.is_empty:
+        return [], ground
+    candidates: list[tuple[float, str, str, dict[str, Any], BaseGeometry]] = []
+    for feature in features:
+        properties = feature.get("properties") or {}
+        name = primary_name(properties)
+        feature_key = str(feature.get("id") or "")
+        if (
+            not name
+            or not feature_key
+            or properties.get("class") in LAND_USE_EXCLUDED_CLASSES
+        ):
+            continue
+        geometry = valid_geometry(feature, required=False)
+        if geometry is None or geometry.geom_type not in ("Polygon", "MultiPolygon"):
+            continue
+        if not geometry.intersects(ground):
+            continue
+        size = sum(polygon_square_meters(polygon) for polygon in polygons_of(geometry))
+        candidates.append((size, name, feature_key, feature, geometry))
+    candidates.sort(key=lambda candidate: candidate[:3])
+    areas: list[dict[str, Any]] = []
+    remaining = ground
+    for _, name, feature_key, feature, geometry in candidates:
+        if len(areas) >= budget:
+            break
+        piece = polygonal(polygonal(geometry).intersection(remaining))
+        if piece.is_empty:
+            continue
+        if square_meters_within(piece, piece) < NEIGHBORHOOD_MINIMUM_SQUARE_METERS:
+            continue
+        remaining = polygonal(remaining.difference(piece))
+        areas.append(
+            {
+                "type": "Feature",
+                "id": feature_key,
+                "properties": {
+                    "names": {"primary": name},
+                    "subtype": "neighborhood",
+                    "drawn_from_land_use": True,
+                },
+                "geometry": mapping(piece),
+            }
+        )
+    return areas, remaining
+
+
+def road_areas(
+    ground: BaseGeometry,
+    *,
+    boundaries: list[BaseGeometry],
+    roads: list[tuple[str, BaseGeometry]],
+    road_ranks: dict[str, int],
+    road_names: dict[str, str],
+    water: BaseGeometry | None,
+    place_name: str,
+    budget: int,
+    taken: set[str],
+) -> list[dict[str, Any]]:
+    """[ground] cut along main roads into compact areas named after their main
+    road, at most [budget] of them."""
+    if budget <= 0 or ground.is_empty:
+        return []
+    if water is not None:
+        # A lake is not ground to explore, so no area is drawn on it.
+        large_water = [
+            polygon
+            for polygon in polygons_of(water)
+            if polygon_square_meters(polygon) >= POINT_NEIGHBORHOOD_WATER_CUT_SQUARE_METERS
+        ]
+        if large_water:
+            ground = polygonal(ground.difference(unary_union(large_water)))
+    if square_meters_within(ground, ground) < ROAD_AREA_MINIMUM_SQUARE_METERS:
+        return []
+    to_meters, to_degrees = metric_frame(ground.centroid.y)
+    cut = [block for block in cut_blocks(ground, boundaries, None, to_meters) if block.area >= 1]
+    if not cut:
+        return []
+    total = sum(block.area for block in cut)
+
+    def split(target: float) -> list[BaseGeometry]:
+        """The blocks, with any far larger than [target] split into pieces
+        of about [target] around a square lattice of seeds."""
+        pieces: list[BaseGeometry] = []
+        spacing = math.sqrt(target)
+        for block in cut:
+            if block.area <= target * ROAD_AREA_SPLIT_FACTOR:
+                pieces.append(block)
+                continue
+            west, south, east, north = block.bounds
+            seeds = [
+                Point(west + spacing * (column + 0.5), south + spacing * (row + 0.5))
+                for row in range(max(1, math.ceil((north - south) / spacing)))
+                for column in range(max(1, math.ceil((east - west) / spacing)))
+            ]
+            seeds = [seed for seed in seeds if block.contains(seed)]
+            if len(seeds) < 2:
+                pieces.append(block)
+                continue
+            cells = shapely.voronoi_polygons(MultiPoint(seeds), extend_to=block)
+            for cell in cells.geoms:
+                pieces.extend(
+                    piece for piece in polygons_of(cell.intersection(block)) if piece.area >= 1
+                )
+        return pieces
+
+    def grow(blocks: list[BaseGeometry], target: float) -> list[list[int]]:
+        tree = STRtree(blocks)
+        neighbours = [
+            [
+                int(other)
+                for other in tree.query(block, predicate="intersects")
+                if int(other) != index
+                and block.boundary.intersection(blocks[int(other)].boundary).length > 1
+            ]
+            for index, block in enumerate(blocks)
+        ]
+        owner: dict[int, int] = {}
+        groups: list[list[int]] = []
+        for seed in sorted(range(len(blocks)), key=lambda index: -blocks[index].area):
+            if seed in owner:
+                continue
+            group = [seed]
+            owner[seed] = len(groups)
+            size = blocks[seed].area
+            center = blocks[seed].representative_point()
+            frontier = {index for index in neighbours[seed] if index not in owner}
+            while size < target and frontier:
+                # The closest block keeps the area compact.
+                chosen = min(
+                    frontier,
+                    key=lambda index: (blocks[index].distance(center), index),
+                )
+                frontier.discard(chosen)
+                if chosen in owner:
+                    continue
+                owner[chosen] = len(groups)
+                group.append(chosen)
+                size += blocks[chosen].area
+                frontier.update(index for index in neighbours[chosen] if index not in owner)
+            groups.append(group)
+        # A small leftover joins the neighbouring area it shares most with.
+        merged = [list(group) for group in groups]
+        for index, group in enumerate(groups):
+            if sum(blocks[member].area for member in group) >= target / 4:
+                continue
+            around = [
+                owner[other]
+                for member in group
+                for other in neighbours[member]
+                if owner[other] != index and merged[owner[other]]
+            ]
+            if not around:
+                continue
+            into = max(set(around), key=lambda candidate: (around.count(candidate), -candidate))
+            merged[into].extend(group)
+            merged[index] = []
+            for member in group:
+                owner[member] = into
+        return [group for group in merged if group]
+
+    target = max(ROAD_AREA_TARGET_SQUARE_METERS, total / budget)
+    blocks = split(target)
+    groups = grow(blocks, target)
+    while len(groups) > budget:
+        target *= 1.5
+        blocks = split(target)
+        groups = grow(blocks, target)
+
+    road_geometries = [to_meters(geometry) for _, geometry in roads]
+    road_tree = STRtree(road_geometries) if road_geometries else None
+    used = set(taken)
+    whole_center = unary_union(blocks).centroid
+    areas: list[dict[str, Any]] = []
+    for group in groups:
+        shape_meters = unary_union([blocks[member] for member in group])
+        if shape_meters.area < ROAD_AREA_MINIMUM_SQUARE_METERS:
+            continue
+        reach = shape_meters.buffer(ROAD_AREA_NAMING_METERS)
+        lengths: dict[str, float] = {}
+        if road_tree is not None:
+            for raw in road_tree.query(reach, predicate="intersects"):
+                name = roads[int(raw)][0]
+                lengths[name] = lengths.get(name, 0.0) + road_geometries[int(raw)].intersection(reach).length
+        ranked = sorted(
+            lengths,
+            key=lambda name: (-road_ranks.get(name, 0), -lengths[name], name),
+        )
+        written = [f"{road_names.get(road, road)} area" for road in ranked]
+        name = next((candidate for candidate in written if candidate not in used), None)
+        if name is None:
+            base = written[0] if written else f"{place_name} outskirts"
+            # A name already taken reads with the side of the place it is on.
+            name = f"{base} ({compass_word(whole_center, shape_meters.representative_point())})"
+            number = 2
+            while name in used:
+                name = f"{base} {number}"
+                number += 1
+        used.add(name)
+        geometry = to_degrees(shape_meters)
+        center = geometry.representative_point()
+        digest = hashlib.sha1(
+            f"{name}|{center.x:.3f}|{center.y:.3f}".encode("utf-8")
+        ).hexdigest()[:16]
+        areas.append(
+            {
+                "type": "Feature",
+                "id": f"road-{digest}",
+                "properties": {
+                    "names": {"primary": name},
+                    "subtype": "neighborhood",
+                    "drawn_from_roads": True,
+                },
+                "geometry": mapping(geometry),
+            }
+        )
+    return areas
 
 
 def point_neighborhoods(
@@ -1139,32 +1576,8 @@ def point_neighborhoods(
         return []
 
     # Distances are measured in metres on a local plane around the place.
-    x_meters = math.cos(math.radians(city_geometry.centroid.y)) * METERS_PER_DEGREE
-
-    def to_meters(geometry: BaseGeometry) -> BaseGeometry:
-        return scale(geometry, xfact=x_meters, yfact=METERS_PER_DEGREE, origin=(0, 0))
-
-    def to_degrees(geometry: BaseGeometry) -> BaseGeometry:
-        return scale(
-            geometry, xfact=1 / x_meters, yfact=1 / METERS_PER_DEGREE, origin=(0, 0)
-        )
-
-    city = to_meters(city_geometry)
-    cuts: list[BaseGeometry] = [city.boundary]
-    cuts.extend(to_meters(line).intersection(city) for line in boundaries)
-    if water is not None:
-        for polygon in polygons_of(water):
-            if (
-                polygon.intersects(city_geometry)
-                and polygon_square_meters(polygon)
-                >= POINT_NEIGHBORHOOD_WATER_CUT_SQUARE_METERS
-            ):
-                cuts.append(to_meters(polygon).boundary.intersection(city))
-    blocks = [
-        block
-        for block in polygonize(unary_union([cut for cut in cuts if not cut.is_empty]))
-        if city.contains(block.representative_point())
-    ]
+    to_meters, to_degrees = metric_frame(city_geometry.centroid.y)
+    blocks = cut_blocks(city_geometry, boundaries, water, to_meters)
 
     anchors = [to_meters(point) for _, point in points]
     tree = STRtree(anchors)
