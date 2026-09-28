@@ -38,8 +38,13 @@ CITY_SEARCH_RADIUS_DEGREES = 0.5
 # harbour quay. Keep in sync with CITY_MATCH_TOLERANCE_METERS in worker.js.
 CITY_MATCH_TOLERANCE_DEGREES = 0.002
 BOUNDARY_SIMPLIFICATION_DEGREES = 0.00002
-# Keep in sync with CURRENT_BUNDLE_REVISION in worker.js.
-BUNDLE_REVISION = 7
+# Keep in sync with CURRENT_BUNDLE_REVISION in worker.js. Revision 8 names the
+# country and region each place belongs to.
+BUNDLE_REVISION = 8
+# Division subtypes that stand for the region a place is grouped under, most
+# fitting first. Countries without Overture regions, such as Slovenia, group
+# their places by the next level down instead of leaving them unnamed.
+REGION_SUBTYPES = ("region", "macroregion", "macrocounty", "county")
 OVERPASS_QUERY_TIMEOUT_SECONDS = 180
 OVERPASS_ATTEMPT_TIMEOUT_SECONDS = 210
 OVERPASS_MAX_RESPONSE_BYTES = 128 * 1024 * 1024
@@ -180,6 +185,7 @@ def main() -> None:
             roads=roads,
             water=water,
             nearby=nearby,
+            place=place_hierarchy(city_feature, hierarchy),
         )
         if args.output is not None:
             args.output.write_text(
@@ -845,6 +851,7 @@ def make_bundle(
     roads: list[tuple[str, BaseGeometry]],
     water: BaseGeometry | None = None,
     nearby: list[dict[str, Any]] | None = None,
+    place: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     road_geometries = [geometry for _, geometry in roads]
     tree = STRtree(road_geometries)
@@ -877,7 +884,76 @@ def make_bundle(
             "districts": district_indices,
             "neighborhoods": neighborhood_indices,
         },
+        # The country and region the app groups this place under, so it never
+        # has to ask a reverse geocoder for them.
+        "hierarchy": place or {},
     }
+
+
+def place_hierarchy(
+    city: dict[str, Any],
+    divisions: Iterable[dict[str, Any]],
+) -> dict[str, str]:
+    """The country and region the place belongs to, from Overture.
+
+    Every Overture division carries the ISO 3166-1 code of its country, the
+    ISO 3166-2 code of its principal subdivision, and the chain of divisions
+    above it with their names. The app used to ask a reverse geocoder for
+    these, one request per place, and places in countries whose regions that
+    geocoder does not report stayed unnamed. Reading them here names every
+    place the moment its bundle arrives.
+    """
+    properties = city.get("properties") or {}
+    division_id = properties.get("division_id")
+    record: dict[str, Any] = {}
+    for division in divisions:
+        division_properties = division.get("properties") or {}
+        if (division.get("id") or division_properties.get("id")) == division_id:
+            record = division_properties
+            break
+    hierarchies = record.get("hierarchies")
+    chain: list[dict[str, Any]] = []
+    if isinstance(hierarchies, list) and hierarchies and isinstance(hierarchies[0], list):
+        chain = [entry for entry in hierarchies[0] if isinstance(entry, dict)]
+
+    def named(subtype: str) -> str | None:
+        for entry in chain:
+            name = entry.get("name")
+            if entry.get("subtype") == subtype and isinstance(name, str) and name.strip():
+                return name.strip()
+        return None
+
+    region_name = next(
+        (name for subtype in REGION_SUBTYPES if (name := named(subtype))), None
+    )
+    if region_name is None and properties.get("subtype") in REGION_SUBTYPES:
+        # A place that is itself a region, such as Berlin, names itself.
+        region_name = primary_name(properties) or None
+
+    place: dict[str, str] = {}
+    country_code = record.get("country") or properties.get("country")
+    if isinstance(country_code, str) and re.fullmatch(r"[A-Z]{2}", country_code):
+        place["countryCode"] = country_code
+    if country_name := named("country"):
+        place["countryName"] = country_name
+    region_code = record.get("region") or properties.get("region")
+    if isinstance(region_code, str) and re.fullmatch(r"[A-Z]{2}-[A-Z0-9]{1,3}", region_code):
+        place["regionCode"] = region_code
+        if region_name is None:
+            # Without the place's own record, the region's record read nearby
+            # names it by its code.
+            for division in divisions:
+                division_properties = division.get("properties") or {}
+                if (
+                    division_properties.get("subtype") in REGION_SUBTYPES
+                    and division_properties.get("region") == region_code
+                ):
+                    region_name = primary_name(division_properties) or None
+                    if region_name:
+                        break
+    if region_name:
+        place["regionName"] = region_name
+    return place
 
 
 def street_index(
