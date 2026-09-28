@@ -29,6 +29,26 @@ and picks up the new one without a relaunch. Once the fresh bundle is
 published, the city's older bundles and the lookup tiles it no longer
 covers are deleted, so the bucket holds one bundle per city.
 
+## Rebuilding every city after a revision
+
+The Worker rebuilds a city only when someone asks for it, so after
+`BUNDLE_REVISION` goes up, a city nobody opens keeps its old bundle and the
+next explorer there first gets the old areas. After deploying a new revision,
+rebuild every stored city, then remove what the rebuilds left:
+
+```
+python3 rebuild_bundles.py rebuild
+python3 rebuild_bundles.py clean
+```
+
+Run `clean` once the builds have finished. A rebuild on a newer Overture
+release can publish a city under a new id, and `clean` deletes the old id's
+manifest, bundles and index entries, but only when the Worker already answers
+that city's point with a current bundle. Both commands take `--dry-run`. The
+script needs a `npx wrangler login` session and an authenticated `gh`, and it
+starts builds the way the Worker does, so coordinates stay out of the public
+logs.
+
 ## Privacy of public logs
 
 This repository is public so that GitHub Actions minutes cost nothing, which
