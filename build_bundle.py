@@ -56,7 +56,8 @@ BOUNDARY_SIMPLIFICATION_DEGREES = 0.00002
 # and campuses, then road-bounded areas named after their main road.
 # Revision 12 names road-bounded areas after the land filling them or their
 # crossroads, and folds areas with few streets into their neighbours.
-BUNDLE_REVISION = 12
+# Revision 13 also drops street types that lead a name, as in Romanian.
+BUNDLE_REVISION = 13
 # Division subtypes that stand for the region a place is grouped under, most
 # fitting first. Countries without Overture regions, such as Slovenia, group
 # their places by the next level down instead of leaving them unnamed.
@@ -121,6 +122,36 @@ STREET_TYPE_WORDS = frozenset(
         "ct", "crescent", "cres", "terrace", "parkway", "pkwy", "highway",
         "hwy", "expressway", "freeway", "trail", "gate", "circle", "row",
     }
+)
+# Street type words that lead a street's name in Romanian, French, Spanish,
+# Italian and Portuguese, which a crossroads name leaves out the same way:
+# "Șoseaua Giurgiului & Strada Alexandru Anghel" reads "Giurgiului &
+# Alexandru Anghel". German and Dutch join the type onto the name, as in
+# Hauptstraße, so they keep it.
+LEADING_STREET_TYPE_WORDS = frozenset(
+    {
+        # Romanian
+        "strada", "str", "șoseaua", "şoseaua", "soseaua", "bulevardul", "bd",
+        "bdul", "b-dul", "calea", "splaiul", "aleea", "drumul", "intrarea",
+        "piața", "piaţa", "piata", "pasajul", "pasaj", "podul", "pod",
+        "prelungirea", "autostrada",
+        # French
+        "rue", "avenue", "av", "boulevard", "chemin", "allée", "allee",
+        "impasse", "route", "quai", "cours",
+        # Spanish
+        "calle", "avenida", "avda", "paseo", "camino", "carretera", "ronda",
+        "travesía", "travesia",
+        # Italian
+        "via", "viale", "corso", "piazza", "vicolo", "strada",
+        # Portuguese
+        "rua", "travessa", "estrada", "alameda", "largo",
+    }
+)
+# Small words a name can start with once its type is gone, such as "de" in
+# "Șoseaua de Centură". A name left starting with one keeps its type.
+NAME_PARTICLES = frozenset(
+    {"de", "del", "della", "delle", "di", "da", "do", "dos", "das", "du",
+     "des", "la", "le", "les", "el", "los", "las", "a", "al", "lui"}
 )
 # A block this many times the target area, such as a hillside few main roads
 # cross, is split into pieces of about the target area.
@@ -313,6 +344,7 @@ def main() -> None:
             # open is filled with named local areas.
             drawn = fill_open_ground(
                 open_ground=open_ground,
+                named={primary_name(area.get("properties") or {}) for area in neighborhoods},
                 divisions=hierarchy,
                 land_use=land_use,
                 boundaries=boundaries,
@@ -1294,6 +1326,7 @@ def compass_word(origin: BaseGeometry, point: BaseGeometry) -> str:
 def fill_open_ground(
     *,
     open_ground: BaseGeometry,
+    named: set[str],
     divisions: Iterable[dict[str, Any]],
     land_use: Iterable[dict[str, Any]],
     boundaries: list[BaseGeometry],
@@ -1312,14 +1345,29 @@ def fill_open_ground(
     into areas named after their main road, so every part of the place large
     enough to stand in belongs to a named area.
     """
-    points = point_neighborhoods(divisions, open_ground, boundaries, water)[:budget]
+    # A point or a piece of land named like an area the place already has,
+    # such as a point beside its own outline, would list the name twice.
+    taken = {name.casefold() for name in named}
+    points = [
+        area
+        for area in point_neighborhoods(divisions, open_ground, boundaries, water)
+        if primary_name(area["properties"]).casefold() not in taken
+    ][:budget]
+    taken |= {primary_name(area["properties"]).casefold() for area in points}
     remaining = open_ground
     if points:
         remaining = polygonal(
             remaining.difference(unary_union([valid_geometry(area) for area in points]))
         )
     land_use = list(land_use)
-    named, remaining = land_use_areas(land_use, remaining, budget - len(points))
+    distinct_land_use = [
+        feature
+        for feature in land_use
+        if primary_name(feature.get("properties") or {}).casefold() not in taken
+    ]
+    named_land, remaining = land_use_areas(
+        distinct_land_use, remaining, budget - len(points)
+    )
     chunks = road_areas(
         remaining,
         landmarks=land_use,
@@ -1329,15 +1377,18 @@ def fill_open_ground(
         road_names=road_names,
         water=water,
         place_name=place_name,
-        budget=budget - len(points) - len(named),
-        taken={primary_name(area["properties"]) for area in [*points, *named]},
+        budget=budget - len(points) - len(named_land),
+        taken={
+            *named,
+            *(primary_name(area["properties"]) for area in [*points, *named_land]),
+        },
     )
     if not PUBLIC_LOG:
         print(
             f"Open ground filled: {len(points)} from named points, "
-            f"{len(named)} from named land, {len(chunks)} along roads"
+            f"{len(named_land)} from named land, {len(chunks)} along roads"
         )
-    return [*points, *named, *chunks]
+    return [*points, *named_land, *chunks]
 
 
 def land_use_areas(
@@ -1658,8 +1709,9 @@ def landmark_name(
 
 def short_street_name(written: str) -> str:
     """[written] without its street type word, as people give directions:
-    "Courtney Street" reads "Courtney". A name the type word is needed for,
-    such as "Ring Road", keeps it."""
+    "Courtney Street" reads "Courtney" and "Strada Alexandru Anghel" reads
+    "Alexandru Anghel". A name the type word is needed for, such as "Ring
+    Road" or "Șoseaua de Centură", keeps it."""
     def keeps(rest: list[str]) -> bool:
         text = " ".join(rest)
         return bool(rest) and (
@@ -1670,6 +1722,13 @@ def short_street_name(written: str) -> str:
         return value.lower().rstrip(".")
 
     words = written.split()
+    if (
+        len(words) > 1
+        and word(words[0]) in LEADING_STREET_TYPE_WORDS
+        and word(words[1]) not in NAME_PARTICLES
+        and keeps(words[1:])
+    ):
+        return " ".join(words[1:])
     if len(words) > 1 and word(words[-1]) in DIRECTION_WORDS and keeps(words[:-1]):
         words = words[:-1]
     if len(words) > 1 and word(words[-1]) in STREET_TYPE_WORDS and keeps(words[:-1]):
