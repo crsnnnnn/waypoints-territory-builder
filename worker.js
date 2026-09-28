@@ -12,7 +12,7 @@ const REQUIRED_BUNDLE_REVISION = 6;
 // an expired bundle is, so a builder change reaches every city without leaving
 // anyone without data while it rebuilds. Keep in sync with BUNDLE_REVISION in
 // build_bundle.py.
-const CURRENT_BUNDLE_REVISION = 13;
+const CURRENT_BUNDLE_REVISION = 14;
 // Covers the builder's CITY_MATCH_TOLERANCE_DEGREES, so a coastal request just
 // past a city's land boundary finds the bundle built for it.
 const CITY_MATCH_TOLERANCE_METERS = 250;

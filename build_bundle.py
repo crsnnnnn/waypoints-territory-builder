@@ -57,7 +57,10 @@ BOUNDARY_SIMPLIFICATION_DEGREES = 0.00002
 # Revision 12 names road-bounded areas after the land filling them or their
 # crossroads, and folds areas with few streets into their neighbours.
 # Revision 13 also drops street types that lead a name, as in Romanian.
-BUNDLE_REVISION = 13
+# Revision 14 merges areas of one name that are one place mapped twice, only
+# lets a point claim vast blocks within its reach, and keeps the largest point
+# areas when a place has more points than room.
+BUNDLE_REVISION = 14
 # Division subtypes that stand for the region a place is grouped under, most
 # fitting first. Countries without Overture regions, such as Slovenia, group
 # their places by the next level down instead of leaving them unnamed.
@@ -96,6 +99,10 @@ ROAD_AREA_NAMING_METERS = 40.0
 # A road-bounded area with fewer named streets than this joins its neighbour,
 # since a card counting two streets is not worth its own place.
 ROAD_AREA_MINIMUM_STREETS = 8
+# Areas of one name this close together are one place mapped twice, such as
+# the two overlapping Chitila outlines in Bucharest, and are merged. Areas of
+# one name further apart are different places that share it.
+SAME_NAME_MERGE_METERS = 100.0
 # Only an area smaller than the target joins a neighbour for having few
 # streets, and never into an area larger than this many times the target, so
 # farmland with few streets is not swallowed into one vast area.
@@ -174,6 +181,14 @@ HIGHWAY_RANKS = {
 # A block with no neighbourhood point of its own joins the nearest one only
 # this close, so farmland and industry at a town's edge are left to the grid.
 POINT_NEIGHBORHOOD_REACH_METERS = 1_500.0
+# A block larger than this that holds a neighbourhood point, such as a
+# national park few roads cross, is only claimed within
+# POINT_NEIGHBORHOOD_REACH_METERS of the point, and the rest is left to named
+# land and road areas.
+POINT_BLOCK_CLIP_SQUARE_METERS = 10_000_000.0
+# Share of the room left under MAXIMUM_AREAS kept for named land and road
+# areas when a place has more named points than room for them.
+POINT_BUDGET_RESERVE_SHARE = 0.2
 # Water at least this large cuts neighbourhoods apart, the way a river does.
 POINT_NEIGHBORHOOD_WATER_CUT_SQUARE_METERS = 50_000.0
 # Roads and railways that bound neighbourhoods.
@@ -301,6 +316,7 @@ def main() -> None:
             if square_meters_within(valid_geometry(area), city_geometry)
             >= NEIGHBORHOOD_MINIMUM_SQUARE_METERS
         ]
+        neighborhoods = merge_same_name_areas(neighborhoods)
         # Ground no outline covers, which the explorer should still find a
         # named local area on.
         open_ground = open_neighborhood_ground(city_geometry, neighborhoods)
@@ -1202,6 +1218,59 @@ def boundary_lines(
     return lines
 
 
+def merge_same_name_areas(areas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """[areas] with each place mapped twice under one name merged into one.
+
+    Areas of the same name, ignoring case, that overlap, touch or lie within
+    SAME_NAME_MERGE_METERS of each other become one area over their joint
+    ground. It keeps the largest member's ID and properties and its place in
+    the list, so a rebuild names the ground the same way. Same-named areas
+    further apart stay separate.
+    """
+    by_name: dict[str, list[int]] = {}
+    for index, area in enumerate(areas):
+        name = primary_name(area.get("properties") or {}).casefold()
+        if name:
+            by_name.setdefault(name, []).append(index)
+    replaced: dict[int, dict[str, Any]] = {}
+    dropped: set[int] = set()
+    for members in by_name.values():
+        if len(members) < 2:
+            continue
+        geometries = {index: valid_geometry(areas[index]) for index in members}
+        to_meters, _ = metric_frame(geometries[members[0]].centroid.y)
+        in_meters = {index: to_meters(geometry) for index, geometry in geometries.items()}
+        clusters: list[list[int]] = []
+        for index in members:
+            joined = [
+                cluster
+                for cluster in clusters
+                if any(
+                    in_meters[index].distance(in_meters[other]) <= SAME_NAME_MERGE_METERS
+                    for other in cluster
+                )
+            ]
+            merged = [index]
+            for cluster in joined:
+                merged.extend(cluster)
+                clusters.remove(cluster)
+            clusters.append(merged)
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            keeper = max(
+                cluster, key=lambda index: (in_meters[index].area, -index)
+            )
+            union = polygonal(unary_union([geometries[index] for index in cluster]))
+            replaced[keeper] = {**areas[keeper], "geometry": mapping(union)}
+            dropped.update(index for index in cluster if index != keeper)
+    return [
+        replaced.get(index, area)
+        for index, area in enumerate(areas)
+        if index not in dropped
+    ]
+
+
 def square_meters_within(geometry: BaseGeometry, place: BaseGeometry) -> float:
     return sum(
         polygon_square_meters(polygon)
@@ -1352,11 +1421,18 @@ def fill_open_ground(
     # A point or a piece of land named like an area the place already has,
     # such as a point beside its own outline, would list the name twice.
     taken = {name.casefold() for name in named}
-    points = [
-        area
-        for area in point_neighborhoods(divisions, open_ground, boundaries, water)
-        if primary_name(area["properties"]).casefold() not in taken
-    ][:budget]
+    # With more named points than room, a share of the room stays for named
+    # land and road areas, so the points never crowd out the rest of the fill.
+    point_room = budget - int(budget * POINT_BUDGET_RESERVE_SHARE)
+    points = merge_same_name_areas(
+        [
+            area
+            for area in point_neighborhoods(
+                divisions, open_ground, boundaries, water, maximum=point_room
+            )
+            if primary_name(area["properties"]).casefold() not in taken
+        ]
+    )[:budget]
     taken |= {primary_name(area["properties"]).casefold() for area in points}
     remaining = open_ground
     if points:
@@ -1369,8 +1445,12 @@ def fill_open_ground(
         for feature in land_use
         if primary_name(feature.get("properties") or {}).casefold() not in taken
     ]
+    # Named land leaves the same share of the room for road areas, so the
+    # ground neither points nor named land claim is not split into a handful
+    # of vast areas.
+    reserve = int(budget * POINT_BUDGET_RESERVE_SHARE)
     named_land, remaining = land_use_areas(
-        distinct_land_use, remaining, budget - len(points)
+        distinct_land_use, remaining, max(0, budget - len(points) - reserve)
     )
     chunks = road_areas(
         remaining,
@@ -1426,6 +1506,11 @@ def land_use_areas(
             continue
         size = sum(polygon_square_meters(polygon) for polygon in polygons_of(geometry))
         candidates.append((size, name, feature_key, feature, geometry))
+    if len(candidates) > budget:
+        # With more named land than room, the largest places are the ones
+        # kept, so a national park is never dropped for a sports field.
+        candidates.sort(key=lambda candidate: (-candidate[0], candidate[1], candidate[2]))
+        candidates = candidates[:budget]
     candidates.sort(key=lambda candidate: candidate[:3])
     areas: list[dict[str, Any]] = []
     remaining = ground
@@ -1572,10 +1657,6 @@ def road_areas(
     target = max(ROAD_AREA_TARGET_SQUARE_METERS, total / budget)
     blocks = split(target)
     groups = grow(blocks, target)
-    while len(groups) > budget:
-        target *= 1.5
-        blocks = split(target)
-        groups = grow(blocks, target)
 
     road_geometries = [to_meters(geometry) for _, geometry in roads]
     road_tree = STRtree(road_geometries) if road_geometries else None
@@ -1588,6 +1669,26 @@ def road_areas(
     shapes = [
         polygonal(unary_union([blocks[member] for member in group])) for group in groups
     ]
+    # With more pieces than room, the smallest joins the neighbour it shares
+    # the longest edge with, or is left to the grid when it has none, until
+    # the rest fit. Enlarging every area instead made vast ones where many
+    # small pieces had nothing to join.
+    while sum(1 for shape in shapes if not shape.is_empty) > budget:
+        index = min(
+            (index for index, shape in enumerate(shapes) if not shape.is_empty),
+            key=lambda index: (shapes[index].area, index),
+        )
+        shape = shapes[index]
+        shared = [
+            (shape.boundary.intersection(other.boundary).length, other_index)
+            for other_index, other in enumerate(shapes)
+            if other_index != index and not other.is_empty and shape.touches(other)
+        ]
+        shared = [item for item in shared if item[0] > 1]
+        if shared:
+            _, into = max(shared)
+            shapes[into] = polygonal(unary_union([shapes[into], shape]))
+        shapes[index] = shapely.Polygon()
     # An area with too few streets joins the neighbour it shares the longest
     # edge with, smallest first, until every area counts enough streets or
     # has no neighbour left to join.
@@ -1787,6 +1888,7 @@ def point_neighborhoods(
     city_geometry: BaseGeometry,
     boundaries: Iterable[BaseGeometry],
     water: BaseGeometry | None,
+    maximum: int = MAXIMUM_AREAS,
 ) -> list[dict[str, Any]]:
     """Neighbourhood areas drawn from the named neighbourhood points in
     [city_geometry], the ground of a place that no outline covers.
@@ -1794,8 +1896,14 @@ def point_neighborhoods(
     Main roads, railways, large water and the place's own outline cut it into
     blocks. A block holding one point belongs to that neighbourhood, a block
     holding several is shared between them by distance, and a block holding
-    none joins the nearest point within reach. Each area keeps its point's
-    Overture ID, so a rebuild names the same ground the same way.
+    none joins the nearest point within reach. A vast block is only claimed
+    within reach of the point. Each area keeps its point's Overture ID, so a
+    rebuild names the same ground the same way.
+
+    When the points would draw more than [maximum] areas, the points with the
+    largest areas are kept and the areas are drawn again from them alone, so
+    the dropped points' ground joins their neighbours instead of being left
+    open.
     """
     points: list[tuple[dict[str, Any], BaseGeometry]] = []
     seen: set[str] = set()
@@ -1824,14 +1932,44 @@ def point_neighborhoods(
     # Distances are measured in metres on a local plane around the place.
     to_meters, to_degrees = metric_frame(city_geometry.centroid.y)
     blocks = cut_blocks(city_geometry, boundaries, water, to_meters)
+    areas = draw_point_areas(points, blocks, city_geometry, to_meters, to_degrees)
+    if len(areas) > maximum:
+        sizes = {
+            area["id"]: square_meters_within(valid_geometry(area), city_geometry)
+            for area in areas
+        }
+        kept = {
+            key
+            for key, _ in sorted(sizes.items(), key=lambda item: (-item[1], item[0]))[
+                :maximum
+            ]
+        }
+        points = [(feature, point) for feature, point in points if feature["id"] in kept]
+        areas = draw_point_areas(points, blocks, city_geometry, to_meters, to_degrees)
+    areas.sort(key=lambda area: (primary_name(area["properties"]), area["id"]))
+    return areas[:maximum]
 
+
+def draw_point_areas(
+    points: list[tuple[dict[str, Any], BaseGeometry]],
+    blocks: list[BaseGeometry],
+    city_geometry: BaseGeometry,
+    to_meters,
+    to_degrees,
+) -> list[dict[str, Any]]:
+    """The area each of [points] claims from [blocks]."""
     anchors = [to_meters(point) for _, point in points]
     tree = STRtree(anchors)
     parts: list[list[BaseGeometry]] = [[] for _ in points]
     for block in blocks:
         inside = sorted(int(index) for index in tree.query(block, predicate="contains"))
+        vast = block.area > POINT_BLOCK_CLIP_SQUARE_METERS
         if len(inside) == 1:
-            parts[inside[0]].append(block)
+            parts[inside[0]].append(
+                block.intersection(anchors[inside[0]].buffer(POINT_NEIGHBORHOOD_REACH_METERS))
+                if vast
+                else block
+            )
         elif inside:
             cells = shapely.voronoi_polygons(
                 MultiPoint([anchors[index] for index in inside]), extend_to=block
@@ -1841,9 +1979,16 @@ def point_neighborhoods(
                     (index for index in inside if cell.contains(anchors[index])), None
                 )
                 piece = cell.intersection(block)
+                if vast and owner is not None:
+                    piece = piece.intersection(
+                        anchors[owner].buffer(POINT_NEIGHBORHOOD_REACH_METERS)
+                    )
                 if owner is not None and not piece.is_empty:
                     parts[owner].append(piece)
         else:
+            # A block holding no point, vast or not, only joins a point whose
+            # reach covers its middle, so an airport or a park beside a
+            # neighbourhood is left to named land and road areas.
             center = block.representative_point()
             nearest = int(tree.nearest(center))
             if anchors[nearest].distance(center) <= POINT_NEIGHBORHOOD_REACH_METERS:
@@ -1872,8 +2017,7 @@ def point_neighborhoods(
                 "geometry": mapping(unary_union(polygons)),
             }
         )
-    areas.sort(key=lambda area: (primary_name(area["properties"]), area["id"]))
-    return areas[:250]
+    return areas
 
 
 def make_bundle(
