@@ -9,7 +9,8 @@ Cloudflare Worker in `worker.js`. The Worker checks the R2 spatial index and
 returns the compressed bundle of the city holding that point. When no bundle
 covers it, the Worker starts this repository's workflow once for that zoom-12
 lookup tile. The builder reads boundaries from the latest Overture release and
-named streets from OpenStreetMap, projects the streets onto the app's zoom-20
+named streets from OpenStreetMap through Overpass, or from Overture's road
+segments when every Overpass server fails, projects the streets onto the app's zoom-20
 exploration grid, uploads the bundle to R2, and indexes it for the whole city.
 Outlines under 5 ha, such as plazas tagged as neighbourhoods, are left out.
 The ground the outlines leave open is filled so every part of a place has a

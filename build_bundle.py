@@ -15,6 +15,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -67,12 +68,22 @@ BUNDLE_REVISION = 14
 REGION_SUBTYPES = ("region", "macroregion", "macrocounty", "county")
 OVERPASS_QUERY_TIMEOUT_SECONDS = 180
 OVERPASS_ATTEMPT_TIMEOUT_SECONDS = 210
+# A server that does not answer its status page within this is passed over, so
+# it cannot hold the build for a whole attempt while an explorer waits.
+OVERPASS_STATUS_TIMEOUT_SECONDS = 10
 OVERPASS_MAX_RESPONSE_BYTES = 128 * 1024 * 1024
+OVERPASS_USER_AGENT = "WaypointsTerritoryBuilder/1.0"
 OVERPASS_ENDPOINTS = (
     "https://overpass.openstreetmap.fr/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 )
+# Overture's rail classes the Overpass read knows as BOUNDARY_RAILWAYS.
+OVERTURE_RAILWAYS = {
+    "standard_gauge": "rail",
+    "narrow_gauge": "rail",
+    "light_rail": "light_rail",
+}
 NEIGHBORHOOD_SUBTYPES = ("macrohood", "neighborhood", "microhood")
 # A place that maps its neighbourhoods only as named points, such as Brandon,
 # is split between those points along its main roads, rail lines and large
@@ -579,30 +590,13 @@ def download_features(
     read. Scanning the whole type instead opens the footer of every file of
     the release and took most of a build's time.
     """
-    release = latest_release()
-    files = overture_files(release, feature_type, bounds)
-    source = (
-        files
-        if files is not None
-        else f"overturemaps-us-west-2/release/{release}/theme={OVERTURE_THEMES[feature_type]}/type={feature_type}/"
-    )
-    if files == []:
+    source = overture_source(feature_type, bounds)
+    if source is None:
         return []
-    xmin, ymin, xmax, ymax = bounds
-    # The same row filter the Overture CLI applies.
-    row_filter = (
-        (pyarrow.compute.field("bbox", "xmin") < xmax)
-        & (pyarrow.compute.field("bbox", "xmax") > xmin)
-        & (pyarrow.compute.field("bbox", "ymin") < ymax)
-        & (pyarrow.compute.field("bbox", "ymax") > ymin)
-    )
     try:
-        dataset = pyarrow.dataset.dataset(
-            source,
-            filesystem=pyarrow.fs.S3FileSystem(anonymous=True, region="us-west-2"),
-        )
+        dataset = overture_dataset(source)
         batches = dataset.to_batches(
-            filter=row_filter,
+            filter=overture_bounds_filter(bounds),
             use_threads=True,
             batch_readahead=16,
             fragment_readahead=4,
@@ -653,6 +647,41 @@ def overture_file_index(release: str) -> list[tuple[str, tuple[float, float, flo
             )
         )
     return files
+
+
+def overture_source(
+    feature_type: str, bounds: tuple[float, float, float, float]
+) -> list[str] | str | None:
+    """Where the release keeps [feature_type] around [bounds]: its files, the
+    whole type when the file index cannot be read, or None when no file meets
+    [bounds]."""
+    release = latest_release()
+    files = overture_files(release, feature_type, bounds)
+    if files == []:
+        return None
+    if files is not None:
+        return files
+    return f"overturemaps-us-west-2/release/{release}/theme={OVERTURE_THEMES[feature_type]}/type={feature_type}/"
+
+
+def overture_dataset(source: list[str] | str) -> pyarrow.dataset.Dataset:
+    return pyarrow.dataset.dataset(
+        source,
+        filesystem=pyarrow.fs.S3FileSystem(anonymous=True, region="us-west-2"),
+    )
+
+
+def overture_bounds_filter(
+    bounds: tuple[float, float, float, float],
+) -> pyarrow.compute.Expression:
+    """The same row filter the Overture CLI applies."""
+    xmin, ymin, xmax, ymax = bounds
+    return (
+        (pyarrow.compute.field("bbox", "xmin") < xmax)
+        & (pyarrow.compute.field("bbox", "xmax") > xmin)
+        & (pyarrow.compute.field("bbox", "ymin") < ymax)
+        & (pyarrow.compute.field("bbox", "ymax") > ymin)
+    )
 
 
 def overture_files(
@@ -1097,8 +1126,41 @@ def download_named_roads(
 ]:
     """The place's named streets, the main roads and railways that bound its
     neighbourhoods, each street's highway rank and the name it is written
-    with, from one Overpass read."""
-    west, south, east, north = city_geometry.bounds
+    with.
+
+    Overpass is read first and Overture when every Overpass server fails. The
+    public Overpass servers can all be down or at capacity at once, and
+    Overture carries the same OpenStreetMap streets in files that are always
+    there.
+    """
+    try:
+        return read_streets(overpass_elements(city_geometry.bounds), city_geometry)
+    except RuntimeError:
+        if PUBLIC_LOG:
+            print("Every Overpass server failed, reading streets from Overture")
+    return read_streets(overture_street_elements(city_geometry.bounds), city_geometry)
+
+
+def read_streets(
+    elements: list[dict[str, Any]], city_geometry: BaseGeometry
+) -> tuple[
+    list[tuple[str, BaseGeometry]], list[BaseGeometry], dict[str, int], dict[str, str]
+]:
+    roads = named_roads(elements, city_geometry)
+    if not roads:
+        raise RuntimeError("Street source returned no named roads for the city")
+    return (
+        roads,
+        boundary_lines(elements, city_geometry),
+        highway_ranks(elements),
+        display_names(elements),
+    )
+
+
+def overpass_elements(bounds: tuple[float, float, float, float]) -> list[dict[str, Any]]:
+    """The named streets and railways around [bounds] as Overpass ways, from
+    the first server that holds any."""
+    west, south, east, north = bounds
     box_filter = f"({south:.8f},{west:.8f},{north:.8f},{east:.8f})"
     railways = "|".join(sorted(BOUNDARY_RAILWAYS))
     query = (
@@ -1110,13 +1172,15 @@ def download_named_roads(
     encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
     failure: Exception | None = None
     for endpoint in OVERPASS_ENDPOINTS:
+        if not overpass_answers(endpoint):
+            continue
         request = urllib.request.Request(
             endpoint,
             data=encoded,
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "WaypointsTerritoryBuilder/1.0",
+                "User-Agent": OVERPASS_USER_AGENT,
             },
             method="POST",
         )
@@ -1128,22 +1192,101 @@ def download_named_roads(
                 payload = response.read(OVERPASS_MAX_RESPONSE_BYTES + 1)
             if len(payload) > OVERPASS_MAX_RESPONSE_BYTES:
                 raise RuntimeError("Overpass street response exceeded its byte budget")
-            decoded = json.loads(payload)
-            elements = decoded.get("elements")
+            elements = json.loads(payload).get("elements")
             if not isinstance(elements, list):
                 raise RuntimeError("Overpass street response was malformed")
-            roads = named_roads(elements, city_geometry)
-            if not roads:
+            if not any(
+                isinstance(element, dict)
+                and isinstance(element.get("tags"), dict)
+                and element["tags"].get("highway")
+                for element in elements
+            ):
                 raise RuntimeError("Overpass returned no named roads for the city")
-            return (
-                roads,
-                boundary_lines(elements, city_geometry),
-                highway_ranks(elements),
-                display_names(elements),
-            )
+            return elements
         except (OSError, ValueError, RuntimeError) as error:
             failure = error
     raise RuntimeError("Every Overpass street endpoint failed") from failure
+
+
+def overpass_answers(endpoint: str) -> bool:
+    """Whether the server answers at all. Any HTTP status counts, since a
+    server may not offer the status page and only the query can tell."""
+    request = urllib.request.Request(
+        endpoint.removesuffix("interpreter") + "status",
+        headers={"User-Agent": OVERPASS_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=OVERPASS_STATUS_TIMEOUT_SECONDS):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except OSError:
+        return False
+
+
+def overture_street_elements(
+    bounds: tuple[float, float, float, float],
+) -> list[dict[str, Any]]:
+    """The named streets and railways around [bounds] from Overture, written as
+    the ways Overpass returns so one reader serves both sources."""
+    source = overture_source("segment", bounds)
+    if source is None:
+        return []
+    field = pyarrow.compute.field
+    roads = (field("subtype") == "road") & field("names", "primary").is_valid()
+    rails = (field("subtype") == "rail") & field("class").isin(list(OVERTURE_RAILWAYS))
+    try:
+        segments = overture_dataset(source).to_table(
+            columns={
+                "name": field("names", "primary"),
+                "subtype": field("subtype"),
+                "class": field("class"),
+                "subclass": field("subclass"),
+                "geometry": field("geometry"),
+            },
+            filter=overture_bounds_filter(bounds) & (roads | rails),
+        )
+    except (OSError, pyarrow.ArrowException) as error:
+        raise RuntimeError("Overture street download failed") from error
+    lines = shapely.from_wkb(segments["geometry"].to_pylist())
+    return [
+        segment_element(tags, line)
+        for tags, line in zip(
+            map(
+                segment_tags,
+                segments["name"].to_pylist(),
+                segments["subtype"].to_pylist(),
+                segments["class"].to_pylist(),
+                segments["subclass"].to_pylist(),
+            ),
+            lines,
+        )
+        if isinstance(line, LineString)
+    ]
+
+
+def segment_tags(
+    name: str | None,
+    subtype: str,
+    road_class: str | None,
+    subclass: str | None,
+) -> dict[str, str]:
+    """The OpenStreetMap tags of an Overture segment."""
+    if subtype == "rail":
+        return {"railway": OVERTURE_RAILWAYS[str(road_class)]}
+    highway = "road" if road_class in (None, "unknown") else road_class
+    return {
+        "name": name,
+        "highway": f"{highway}_link" if subclass == "link" else highway,
+    }
+
+
+def segment_element(tags: dict[str, str], line: LineString) -> dict[str, Any]:
+    return {
+        "type": "way",
+        "tags": tags,
+        "geometry": [{"lat": y, "lon": x} for x, y, *_ in line.coords],
+    }
 
 
 def named_roads(
